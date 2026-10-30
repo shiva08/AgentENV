@@ -1,0 +1,40 @@
+{
+  "log_level": "info",
+  "log_format": "console",
+  "scheduler": {
+    "grpc_listen_addr": "127.0.0.1:9090",
+    "metrics_listen_addr": "127.0.0.1:9101",
+    "strategy": "round_robin",
+    "report_ttl": "30s",
+    "binding_ttl": "8760h",
+    "redis_addr": "127.0.0.1:6379",
+    "discovery": {
+      "mode": "static"
+    },
+    "nodes": [
+      {
+        "id": "node-a",
+        "endpoint": "http://127.0.0.1:8000"
+      },
+      {
+        "id": "node-b",
+        "endpoint": "http://127.0.0.1:8001"
+      }
+    ],
+    "node_resource_limit": {
+      "max_sandbox_count": 8,
+      "max_cpu_allocated_percent": 200,
+      "max_memory_allocated_percent": 100
+    }
+  },
+  "gateway": {
+    "http_listen_addr": "127.0.0.1:8090",
+    "metrics_listen_addr": "127.0.0.1:9102",
+    "scheduler_addr": "127.0.0.1:9090",
+    "query_only_scheduler_addr": "",
+    "idempotency_redis_addr": "127.0.0.1:6379",
+    "request_timeout": "600s",
+    "forward_response_size": 4194304,
+    "sandbox_proxy_domains": []
+  }
+}
