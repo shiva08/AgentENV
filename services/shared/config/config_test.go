@@ -28,8 +28,8 @@ func TestDefaultSchedulerDiscoveryModeIsStatic(t *testing.T) {
 	if got := cfg.Scheduler.ReportTTL; got != 30*time.Second {
 		t.Fatalf("expected scheduler report ttl 30s, got %s", got)
 	}
-	if got := cfg.Scheduler.BindingTTL; got != 30*time.Second {
-		t.Fatalf("expected scheduler binding ttl 30s, got %s", got)
+	if got := cfg.Scheduler.BindingTTL; got != defaultSchedulerBindingTTL {
+		t.Fatalf("expected scheduler binding ttl %s, got %s", defaultSchedulerBindingTTL, got)
 	}
 	if got := cfg.Scheduler.MetricsListenAddr; got != ":9101" {
 		t.Fatalf("expected scheduler metrics listen addr :9101, got %q", got)
@@ -168,6 +168,29 @@ func TestLoadRejectsInvalidGatewayRequestTimeoutEnvDuration(t *testing.T) {
 	}
 }
 
+func TestLoadGatewayIdempotencyKeyTTL(t *testing.T) {
+	cfg, err := Load("", "gateway")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if cfg.Gateway.IdempotencyKeyTTL != 5*24*time.Hour {
+		t.Fatalf("expected default idempotency key ttl 120h, got %s", cfg.Gateway.IdempotencyKeyTTL)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"gateway": {"idempotency_key_ttl": "48h"}}`), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+	if cfg, err = Load(path, "gateway"); err != nil || cfg.Gateway.IdempotencyKeyTTL != 48*time.Hour {
+		t.Fatalf("expected idempotency key ttl 48h from file, got %s, %v", cfg.Gateway.IdempotencyKeyTTL, err)
+	}
+
+	t.Setenv("GATEWAY_IDEMPOTENCY_KEY_TTL", "72h")
+	if cfg, err = Load(path, "gateway"); err != nil || cfg.Gateway.IdempotencyKeyTTL != 72*time.Hour {
+		t.Fatalf("expected idempotency key ttl 72h from env, got %s, %v", cfg.Gateway.IdempotencyKeyTTL, err)
+	}
+}
+
 func TestLoadDefaultsSchedulerDiscoveryToStaticWhenUnset(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "config.json")
@@ -254,8 +277,8 @@ func TestLoadDefaultsSchedulerReportTTLWhenUnset(t *testing.T) {
 	if got := cfg.Scheduler.ReportTTL; got != 30*time.Second {
 		t.Fatalf("expected scheduler report ttl default 30s, got %s", got)
 	}
-	if got := cfg.Scheduler.BindingTTL; got != 30*time.Second {
-		t.Fatalf("expected scheduler binding ttl default 30s, got %s", got)
+	if got := cfg.Scheduler.BindingTTL; got != defaultSchedulerBindingTTL {
+		t.Fatalf("expected scheduler binding ttl default %s, got %s", defaultSchedulerBindingTTL, got)
 	}
 }
 

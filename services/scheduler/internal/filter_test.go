@@ -15,7 +15,7 @@ func TestFilterNilLimitKeepsAll(t *testing.T) {
 		{Node: Node{ID: "a"}},
 		{Node: Node{ID: "b"}},
 	}
-	result := FilterByResourceLimit(nodes, nil)
+	result := FilterByResourceLimit(nodes, nil, nil, usage{})
 	if len(result) != 2 {
 		t.Fatalf("expected 2, got %d", len(result))
 	}
@@ -26,7 +26,7 @@ func TestFilterKeepsNodesWithoutSnapshot(t *testing.T) {
 	nodes := []RichNode{
 		{Node: Node{ID: "no-heartbeat"}, Snapshot: nil},
 	}
-	result := FilterByResourceLimit(nodes, limit)
+	result := FilterByResourceLimit(nodes, limit, nil, usage{})
 	if len(result) != 1 {
 		t.Fatalf("expected node without snapshot to be kept, got %d", len(result))
 	}
@@ -39,7 +39,7 @@ func TestFilterMaxSandboxCount(t *testing.T) {
 		{Node: Node{ID: "at-limit"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 10}},
 		{Node: Node{ID: "over"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 11}},
 	}
-	result := FilterByResourceLimit(nodes, limit)
+	result := FilterByResourceLimit(nodes, limit, nil, usage{})
 	if len(result) != 2 {
 		t.Fatalf("expected 2, got %d", len(result))
 	}
@@ -54,7 +54,7 @@ func TestFilterMaxSandboxStartingCount(t *testing.T) {
 		{Node: Node{ID: "ok"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxStartingCount: 1}},
 		{Node: Node{ID: "over"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxStartingCount: 3}},
 	}
-	result := FilterByResourceLimit(nodes, limit)
+	result := FilterByResourceLimit(nodes, limit, nil, usage{})
 	if len(result) != 1 || result[0].ID != "ok" {
 		t.Fatalf("expected [ok], got %v", result)
 	}
@@ -66,7 +66,7 @@ func TestFilterMaxCPUUsedPercent(t *testing.T) {
 		{Node: Node{ID: "ok"}, Snapshot: &schedulerv1.NodeSnapshot{CpuPercent: 50}},
 		{Node: Node{ID: "over"}, Snapshot: &schedulerv1.NodeSnapshot{CpuPercent: 95}},
 	}
-	result := FilterByResourceLimit(nodes, limit)
+	result := FilterByResourceLimit(nodes, limit, nil, usage{})
 	if len(result) != 1 || result[0].ID != "ok" {
 		t.Fatalf("expected [ok], got %v", result)
 	}
@@ -79,7 +79,7 @@ func TestFilterMaxCPUAllocatedPercent(t *testing.T) {
 		{Node: Node{ID: "over"}, Snapshot: &schedulerv1.NodeSnapshot{AllocatedCpu: 6, CpuCount: 8}},     // 75%
 		{Node: Node{ID: "zero-cpu"}, Snapshot: &schedulerv1.NodeSnapshot{AllocatedCpu: 5, CpuCount: 0}}, // skip check
 	}
-	result := FilterByResourceLimit(nodes, limit)
+	result := FilterByResourceLimit(nodes, limit, nil, usage{})
 	if len(result) != 2 {
 		t.Fatalf("expected 2, got %d", len(result))
 	}
@@ -94,7 +94,7 @@ func TestFilterMaxMemoryUsedPercent(t *testing.T) {
 		{Node: Node{ID: "ok"}, Snapshot: &schedulerv1.NodeSnapshot{MemoryUsedBytes: 60, MemoryTotalBytes: 100}},   // 60%
 		{Node: Node{ID: "over"}, Snapshot: &schedulerv1.NodeSnapshot{MemoryUsedBytes: 80, MemoryTotalBytes: 100}}, // 80%
 	}
-	result := FilterByResourceLimit(nodes, limit)
+	result := FilterByResourceLimit(nodes, limit, nil, usage{})
 	if len(result) != 1 || result[0].ID != "ok" {
 		t.Fatalf("expected [ok], got %v", result)
 	}
@@ -106,7 +106,7 @@ func TestFilterMaxMemoryAllocatedPercent(t *testing.T) {
 		{Node: Node{ID: "ok"}, Snapshot: &schedulerv1.NodeSnapshot{AllocatedMemoryBytes: 40, MemoryTotalBytes: 100}},   // 40%
 		{Node: Node{ID: "over"}, Snapshot: &schedulerv1.NodeSnapshot{AllocatedMemoryBytes: 60, MemoryTotalBytes: 100}}, // 60%
 	}
-	result := FilterByResourceLimit(nodes, limit)
+	result := FilterByResourceLimit(nodes, limit, nil, usage{})
 	if len(result) != 1 || result[0].ID != "ok" {
 		t.Fatalf("expected [ok], got %v", result)
 	}
@@ -123,7 +123,7 @@ func TestFilterMultipleLimits(t *testing.T) {
 		{Node: Node{ID: "cpu-over"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 5, CpuPercent: 90}},
 		{Node: Node{ID: "both-over"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 15, CpuPercent: 90}},
 	}
-	result := FilterByResourceLimit(nodes, limit)
+	result := FilterByResourceLimit(nodes, limit, nil, usage{})
 	if len(result) != 1 || result[0].ID != "both-ok" {
 		t.Fatalf("expected [both-ok], got %v", result)
 	}
@@ -134,7 +134,7 @@ func TestFilterAllExcludedReturnsEmpty(t *testing.T) {
 	nodes := []RichNode{
 		{Node: Node{ID: "a"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 1}},
 	}
-	result := FilterByResourceLimit(nodes, limit)
+	result := FilterByResourceLimit(nodes, limit, nil, usage{})
 	if len(result) != 0 {
 		t.Fatalf("expected empty, got %d", len(result))
 	}
@@ -150,7 +150,7 @@ func TestFilterMaxSandboxCountIncludingPaused(t *testing.T) {
 		// 0 running + 0 paused, kept.
 		{Node: Node{ID: "empty"}, Snapshot: &schedulerv1.NodeSnapshot{}},
 	}
-	result := FilterByResourceLimit(nodes, limit)
+	result := FilterByResourceLimit(nodes, limit, nil, usage{})
 	if len(result) != 2 {
 		t.Fatalf("expected 2, got %d", len(result))
 	}
@@ -167,7 +167,7 @@ func TestFilterMaxAllocatedCPUIncludingPaused(t *testing.T) {
 		// 4 active + 5 paused = 9, over.
 		{Node: Node{ID: "over"}, Snapshot: &schedulerv1.NodeSnapshot{AllocatedCpu: 4, PausedAllocatedCpu: 5}},
 	}
-	result := FilterByResourceLimit(nodes, limit)
+	result := FilterByResourceLimit(nodes, limit, nil, usage{})
 	if len(result) != 1 || result[0].ID != "at-limit" {
 		t.Fatalf("expected [at-limit], got %v", result)
 	}
@@ -183,7 +183,7 @@ func TestFilterMaxAllocatedMemoryBytesIncludingPaused(t *testing.T) {
 		// 0 + 0 = 0, kept.
 		{Node: Node{ID: "empty"}, Snapshot: &schedulerv1.NodeSnapshot{}},
 	}
-	result := FilterByResourceLimit(nodes, limit)
+	result := FilterByResourceLimit(nodes, limit, nil, usage{})
 	if len(result) != 2 {
 		t.Fatalf("expected 2, got %d", len(result))
 	}
@@ -205,8 +205,42 @@ func TestFilterIncludingPausedExcludesNodeWithinActiveLimits(t *testing.T) {
 		// Within both.
 		{Node: Node{ID: "ok"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 2, PausedSandboxCount: 2}},
 	}
-	result := FilterByResourceLimit(nodes, limit)
+	result := FilterByResourceLimit(nodes, limit, nil, usage{})
 	if len(result) != 1 || result[0].ID != "ok" {
 		t.Fatalf("expected [ok], got %v", result)
+	}
+}
+
+func TestFilterCountsTheCreateAndReservedCreates(t *testing.T) {
+	limit := &config.NodeResourceLimit{MaxSandboxCount: uint32Ptr(2)}
+	nodes := []RichNode{
+		{Node: Node{ID: "room"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 1}},
+		{Node: Node{ID: "at-limit"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 2}},
+		{Node: Node{ID: "reserved"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 0}},
+		{Node: Node{ID: "starting"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 1, SandboxStartingCount: 1}},
+	}
+	pending := map[string]usage{"reserved": {sandboxes: 2}}
+	result := FilterByResourceLimit(nodes, limit, pending, usage{sandboxes: 1})
+	if len(result) != 1 || result[0].ID != "room" {
+		t.Fatalf("expected [room], got %v", result)
+	}
+}
+
+func TestFilterCountsTheCreatesSize(t *testing.T) {
+	limit := &config.NodeResourceLimit{
+		MaxCPUAllocatedPercent:    uint32Ptr(100),
+		MaxMemoryAllocatedPercent: uint32Ptr(100),
+	}
+	nodes := []RichNode{{Node: Node{ID: "a"}, Snapshot: &schedulerv1.NodeSnapshot{
+		CpuCount: 4, AllocatedCpu: 3, MemoryTotalBytes: 1000, AllocatedMemoryBytes: 500,
+	}}}
+	if got := FilterByResourceLimit(nodes, limit, nil, usage{sandboxes: 1, cpu: 1, memoryBytes: 500}); len(got) != 1 {
+		t.Fatalf("a create that exactly fills the node should fit, got %v", got)
+	}
+	if got := FilterByResourceLimit(nodes, limit, nil, usage{sandboxes: 1, cpu: 2}); len(got) != 0 {
+		t.Fatalf("a create needing 2 of 1 free vCPU should not fit, got %v", got)
+	}
+	if got := FilterByResourceLimit(nodes, limit, nil, usage{sandboxes: 1, memoryBytes: 600}); len(got) != 0 {
+		t.Fatalf("a create needing more memory than is free should not fit, got %v", got)
 	}
 }

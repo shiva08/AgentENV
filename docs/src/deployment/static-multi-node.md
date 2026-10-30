@@ -155,7 +155,7 @@ Create `/etc/agentenv/control-plane.json`:
     "metrics_listen_addr": "127.0.0.1:9101",
     "strategy": "round_robin",
     "report_ttl": "30s",
-    "binding_ttl": "30s",
+    "binding_ttl": "8760h",
     "discovery": {
       "mode": "static"
     },

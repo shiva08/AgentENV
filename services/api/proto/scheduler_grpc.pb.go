@@ -23,6 +23,7 @@ const (
 	Scheduler_ListNodes_FullMethodName          = "/scheduler.v1.Scheduler/ListNodes"
 	Scheduler_LookupNode_FullMethodName         = "/scheduler.v1.Scheduler/LookupNode"
 	Scheduler_RecordAssignment_FullMethodName   = "/scheduler.v1.Scheduler/RecordAssignment"
+	Scheduler_ReleaseReservation_FullMethodName = "/scheduler.v1.Scheduler/ReleaseReservation"
 	Scheduler_Heartbeat_FullMethodName          = "/scheduler.v1.Scheduler/Heartbeat"
 	Scheduler_ReportSandboxEvent_FullMethodName = "/scheduler.v1.Scheduler/ReportSandboxEvent"
 	Scheduler_ListObservedNodes_FullMethodName  = "/scheduler.v1.Scheduler/ListObservedNodes"
@@ -42,6 +43,8 @@ type SchedulerClient interface {
 	ListNodes(ctx context.Context, in *ListNodesRequest, opts ...grpc.CallOption) (*ListNodesResponse, error)
 	LookupNode(ctx context.Context, in *LookupNodeRequest, opts ...grpc.CallOption) (*LookupNodeResponse, error)
 	RecordAssignment(ctx context.Context, in *RecordAssignmentRequest, opts ...grpc.CallOption) (*RecordAssignmentResponse, error)
+	// Frees the capacity Schedule reserved for a create that made no sandbox.
+	ReleaseReservation(ctx context.Context, in *ReleaseReservationRequest, opts ...grpc.CallOption) (*ReleaseReservationResponse, error)
 	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
 	ReportSandboxEvent(ctx context.Context, in *ReportSandboxEventRequest, opts ...grpc.CallOption) (*ReportSandboxEventResponse, error)
 	ListObservedNodes(ctx context.Context, in *ListObservedNodesRequest, opts ...grpc.CallOption) (*ListObservedNodesResponse, error)
@@ -95,6 +98,16 @@ func (c *schedulerClient) RecordAssignment(ctx context.Context, in *RecordAssign
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RecordAssignmentResponse)
 	err := c.cc.Invoke(ctx, Scheduler_RecordAssignment_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *schedulerClient) ReleaseReservation(ctx context.Context, in *ReleaseReservationRequest, opts ...grpc.CallOption) (*ReleaseReservationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReleaseReservationResponse)
+	err := c.cc.Invoke(ctx, Scheduler_ReleaseReservation_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -199,6 +212,8 @@ type SchedulerServer interface {
 	ListNodes(context.Context, *ListNodesRequest) (*ListNodesResponse, error)
 	LookupNode(context.Context, *LookupNodeRequest) (*LookupNodeResponse, error)
 	RecordAssignment(context.Context, *RecordAssignmentRequest) (*RecordAssignmentResponse, error)
+	// Frees the capacity Schedule reserved for a create that made no sandbox.
+	ReleaseReservation(context.Context, *ReleaseReservationRequest) (*ReleaseReservationResponse, error)
 	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
 	ReportSandboxEvent(context.Context, *ReportSandboxEventRequest) (*ReportSandboxEventResponse, error)
 	ListObservedNodes(context.Context, *ListObservedNodesRequest) (*ListObservedNodesResponse, error)
@@ -229,6 +244,9 @@ func (UnimplementedSchedulerServer) LookupNode(context.Context, *LookupNodeReque
 }
 func (UnimplementedSchedulerServer) RecordAssignment(context.Context, *RecordAssignmentRequest) (*RecordAssignmentResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RecordAssignment not implemented")
+}
+func (UnimplementedSchedulerServer) ReleaseReservation(context.Context, *ReleaseReservationRequest) (*ReleaseReservationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseReservation not implemented")
 }
 func (UnimplementedSchedulerServer) Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Heartbeat not implemented")
@@ -346,6 +364,24 @@ func _Scheduler_RecordAssignment_Handler(srv interface{}, ctx context.Context, d
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SchedulerServer).RecordAssignment(ctx, req.(*RecordAssignmentRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Scheduler_ReleaseReservation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReleaseReservationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServer).ReleaseReservation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Scheduler_ReleaseReservation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServer).ReleaseReservation(ctx, req.(*ReleaseReservationRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -534,6 +570,10 @@ var Scheduler_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RecordAssignment",
 			Handler:    _Scheduler_RecordAssignment_Handler,
+		},
+		{
+			MethodName: "ReleaseReservation",
+			Handler:    _Scheduler_ReleaseReservation_Handler,
 		},
 		{
 			MethodName: "Heartbeat",

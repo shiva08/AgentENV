@@ -30,6 +30,7 @@ import (
 	"github.com/libdns/route53"
 	"github.com/libdns/tencentcloud"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -47,6 +48,25 @@ func newSchedulerConn(addr string) (*grpc.ClientConn, error) {
 		addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
+}
+
+func newRedisClient(addr string) (*redis.Client, error) {
+	opts := &redis.Options{Addr: addr}
+	if strings.Contains(addr, "://") {
+		parsed, err := redis.ParseURL(addr)
+		if err != nil {
+			return nil, fmt.Errorf("parse redis address: %w", err)
+		}
+		opts = parsed
+	}
+	client := redis.NewClient(opts)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := client.Ping(ctx).Err(); err != nil {
+		_ = client.Close()
+		return nil, fmt.Errorf("ping redis: %w", err)
+	}
+	return client, nil
 }
 
 func loadAPIKey() (string, error) {
@@ -150,6 +170,15 @@ func main() {
 		queryOnlySchedulerClient = schedulerv1.NewSchedulerClient(queryOnlyConn)
 	}
 
+	var idempotencyRedis *redis.Client
+	if addr := strings.TrimSpace(cfg.Gateway.IdempotencyRedisAddr); addr != "" {
+		idempotencyRedis, err = newRedisClient(addr)
+		if err != nil {
+			logger.Fatal("connect idempotency redis failed", zap.Error(err))
+		}
+		defer idempotencyRedis.Close()
+	}
+
 	s, err := gateway.NewServer(logger, schedulerClient, gateway.ServerOptions{
 		RequestTimeout:           cfg.Gateway.RequestTimeout,
 		MaxResponseSize:          cfg.Gateway.ForwardResponseSize,
@@ -157,6 +186,8 @@ func main() {
 		DebugMode:                cfg.Gateway.DebugMode,
 		SandboxProxyDomains:      cfg.Gateway.SandboxProxyDomains,
 		QueryOnlySchedulerClient: queryOnlySchedulerClient,
+		IdempotencyRedis:         idempotencyRedis,
+		IdempotencyKeyTTL:        cfg.Gateway.IdempotencyKeyTTL,
 	})
 	if err != nil {
 		logger.Fatal("init gateway server failed", zap.Error(err))
@@ -186,6 +217,8 @@ func main() {
 		zap.String("scheduler", cfg.Gateway.SchedulerAddr),
 		zap.String("query_only_scheduler", cfg.Gateway.QueryOnlySchedulerAddr),
 		zap.Strings("sandbox_proxy_domains", s.SandboxProxyDomains()),
+		zap.Bool("idempotency_keys", idempotencyRedis != nil),
+		zap.Duration("idempotency_key_ttl", cfg.Gateway.IdempotencyKeyTTL),
 	)
 	httpServer := &http.Server{
 		Addr:      listenAddr,

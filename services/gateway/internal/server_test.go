@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,6 +31,7 @@ type stubSchedulerClient struct {
 	listNodesFunc          func(context.Context, *schedulerv1.ListNodesRequest, ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error)
 	lookupNodeFunc         func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error)
 	recordAssignmentFunc   func(context.Context, *schedulerv1.RecordAssignmentRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error)
+	releaseReservationFunc func(context.Context, *schedulerv1.ReleaseReservationRequest, ...grpc.CallOption) (*schedulerv1.ReleaseReservationResponse, error)
 	heartbeatFunc          func(context.Context, *schedulerv1.HeartbeatRequest, ...grpc.CallOption) (*schedulerv1.HeartbeatResponse, error)
 	reportSandboxEventFunc func(context.Context, *schedulerv1.ReportSandboxEventRequest, ...grpc.CallOption) (*schedulerv1.ReportSandboxEventResponse, error)
 	listObservedFunc       func(context.Context, *schedulerv1.ListObservedNodesRequest, ...grpc.CallOption) (*schedulerv1.ListObservedNodesResponse, error)
@@ -86,6 +88,13 @@ func (s stubSchedulerClient) RecordAssignment(ctx context.Context, req *schedule
 		return nil, fmt.Errorf("unexpected RecordAssignment call")
 	}
 	return s.recordAssignmentFunc(ctx, req, opts...)
+}
+
+func (s stubSchedulerClient) ReleaseReservation(ctx context.Context, req *schedulerv1.ReleaseReservationRequest, opts ...grpc.CallOption) (*schedulerv1.ReleaseReservationResponse, error) {
+	if s.releaseReservationFunc == nil {
+		return nil, fmt.Errorf("unexpected ReleaseReservation call")
+	}
+	return s.releaseReservationFunc(ctx, req, opts...)
 }
 
 func (s stubSchedulerClient) Heartbeat(ctx context.Context, req *schedulerv1.HeartbeatRequest, opts ...grpc.CallOption) (*schedulerv1.HeartbeatResponse, error) {
@@ -1331,7 +1340,7 @@ func TestHandleProxyAggregatesSandboxListDedupsDuplicateSandboxIDs(t *testing.T)
 	}
 }
 
-func TestHandleProxyClusterListFailsWhenNodeFails(t *testing.T) {
+func TestHandleProxyClusterListSkipsNodesThatDoNotAnswer(t *testing.T) {
 	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode([]listedSandbox{
@@ -1345,12 +1354,59 @@ func TestHandleProxyClusterListFailsWhenNodeFails(t *testing.T) {
 	}))
 	defer failing.Close()
 
+	unreachable := httptest.NewServer(http.NotFoundHandler())
+	unreachable.Close()
+
 	server := newTestServer(t, stubSchedulerClient{
 		listNodesFunc: func(_ context.Context, _ *schedulerv1.ListNodesRequest, _ ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error) {
 			return &schedulerv1.ListNodesResponse{
 				Nodes: []*schedulerv1.Node{
 					{NodeId: "healthy", Endpoint: healthy.URL},
+					{NodeId: "unreachable", Endpoint: unreachable.URL},
 					{NodeId: "failing", Endpoint: failing.URL},
+				},
+			}, nil
+		},
+	}, time.Second, 1024)
+
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
+	defer gatewayServer.Close()
+
+	for _, path := range []string{"/sandboxes", "/v2/sandboxes?limit=10"} {
+		resp, err := http.Get(gatewayServer.URL + path)
+		if err != nil {
+			t.Fatalf("%s: request failed: %v", path, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			t.Fatalf("%s: status = %d, want %d", path, resp.StatusCode, http.StatusOK)
+		}
+		if got := resp.Header.Get("x-agentenv-unavailable-nodes"); got != "failing,unreachable" {
+			t.Fatalf("%s: x-agentenv-unavailable-nodes = %q, want %q", path, got, "failing,unreachable")
+		}
+		items := decodeListedSandboxResponse(t, resp.Body)
+		resp.Body.Close()
+		if got := sandboxIDs(items); !equalStrings(got, []string{"00000000-0000-0000-0000-000000000001"}) {
+			t.Fatalf("%s: sandbox ids = %v, want the healthy node's sandbox", path, got)
+		}
+	}
+}
+
+func TestHandleProxyClusterListFailsWhenNoNodeAnswers(t *testing.T) {
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer failing.Close()
+
+	unreachable := httptest.NewServer(http.NotFoundHandler())
+	unreachable.Close()
+
+	server := newTestServer(t, stubSchedulerClient{
+		listNodesFunc: func(_ context.Context, _ *schedulerv1.ListNodesRequest, _ ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error) {
+			return &schedulerv1.ListNodesResponse{
+				Nodes: []*schedulerv1.Node{
+					{NodeId: "failing", Endpoint: failing.URL},
+					{NodeId: "unreachable", Endpoint: unreachable.URL},
 				},
 			}, nil
 		},
@@ -1367,6 +1423,43 @@ func TestHandleProxyClusterListFailsWhenNodeFails(t *testing.T) {
 
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadGateway)
+	}
+}
+
+func TestHandleProxyClusterListReturnsANodesClientError(t *testing.T) {
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]listedSandbox{})
+	}))
+	defer healthy.Close()
+
+	rejecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "bad query", http.StatusBadRequest)
+	}))
+	defer rejecting.Close()
+
+	server := newTestServer(t, stubSchedulerClient{
+		listNodesFunc: func(_ context.Context, _ *schedulerv1.ListNodesRequest, _ ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error) {
+			return &schedulerv1.ListNodesResponse{
+				Nodes: []*schedulerv1.Node{
+					{NodeId: "healthy", Endpoint: healthy.URL},
+					{NodeId: "rejecting", Endpoint: rejecting.URL},
+				},
+			}, nil
+		},
+	}, time.Second, 1024)
+
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
+	defer gatewayServer.Close()
+
+	resp, err := http.Get(gatewayServer.URL + "/v2/sandboxes")
+	if err != nil {
+		t.Fatalf("cluster list request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
 	}
 }
 
@@ -1727,7 +1820,7 @@ func TestRecordAssignmentFromResponseUsesHeaderWithoutReadingBody(t *testing.T) 
 	resp.Header.Set(headerSandboxID, "sbx-from-header")
 
 	node := &schedulerv1.Node{NodeId: "node-1", Endpoint: "http://node"}
-	if err := server.recordAssignmentFromResponse(context.Background(), resp, node, http.MethodPost, "/sandboxes/sbx-from-header"); err != nil {
+	if err := server.recordAssignmentFromResponse(context.Background(), resp, node, http.MethodPost, "/sandboxes/sbx-from-header", ""); err != nil {
 		t.Fatalf("recordAssignmentFromResponse returned error: %v", err)
 	}
 
@@ -2680,4 +2773,261 @@ func TestV2TemplateBuildBindsFromPathWithoutResponseHeader(t *testing.T) {
 	if got := (<-recorded).GetSandboxId(); got != "build-123" {
 		t.Fatalf("recorded build %q, want build-123", got)
 	}
+}
+
+func refusedURL(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	addr := listener.Addr().String()
+	_ = listener.Close()
+	return "http://" + addr
+}
+
+func TestScheduledCreateRetriesOnAnotherNodeWhenConnectionRefused(t *testing.T) {
+	deadURL := refusedURL(t)
+	bodies := make(chan string, 2)
+	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		payload, _ := io.ReadAll(r.Body)
+		bodies <- string(payload)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"sandboxID":"sbx-1"}`))
+	}))
+	defer live.Close()
+
+	var excludes [][]string
+	recorded := make(chan string, 2)
+	server := newTestServer(t, stubSchedulerClient{
+		scheduleFunc: func(_ context.Context, req *schedulerv1.ScheduleRequest, _ ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			excludes = append(excludes, req.GetExcludeNodeIds())
+			if len(req.GetExcludeNodeIds()) == 0 {
+				return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "node-dead", Endpoint: deadURL}}, nil
+			}
+			return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "node-live", Endpoint: live.URL}}, nil
+		},
+		recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
+			recorded <- req.GetNode().GetNodeId()
+			return &schedulerv1.RecordAssignmentResponse{}, nil
+		},
+	}, time.Second, 1024)
+
+	response := httptest.NewRecorder()
+	authenticatedTestHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/sandboxes-cold", strings.NewReader(`{"image":"img"}`)))
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("got %d: %s, want %d", response.Code, response.Body.String(), http.StatusCreated)
+	}
+	if got := <-bodies; got != `{"image":"img"}` {
+		t.Fatalf("live node got body %q", got)
+	}
+	if want := [][]string{nil, {"node-dead"}}; !reflect.DeepEqual(excludes, want) {
+		t.Fatalf("schedule excludes = %v, want %v", excludes, want)
+	}
+	if got := <-recorded; got != "node-live" {
+		t.Fatalf("recorded node %q, want node-live", got)
+	}
+}
+
+func TestScheduledCreateIsNotRetriedOnceTheNodeMayHaveIt(t *testing.T) {
+	dropsConnection := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack failed: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer dropsConnection.Close()
+
+	schedules := 0
+	server := newTestServer(t, stubSchedulerClient{
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			schedules++
+			return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: dropsConnection.URL}}, nil
+		},
+	}, time.Second, 1024)
+
+	response := httptest.NewRecorder()
+	authenticatedTestHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/sandboxes-cold", strings.NewReader(`{"image":"img"}`)))
+
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("got %d: %s, want %d", response.Code, response.Body.String(), http.StatusBadGateway)
+	}
+	if schedules != 1 {
+		t.Fatalf("scheduled %d times, want 1", schedules)
+	}
+}
+
+func TestScheduledCreateRetriesOnlyOnce(t *testing.T) {
+	deadURLs := []string{refusedURL(t), refusedURL(t)}
+	schedules := 0
+	server := newTestServer(t, stubSchedulerClient{
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			schedules++
+			node := &schedulerv1.Node{NodeId: fmt.Sprintf("node-dead-%d", schedules), Endpoint: deadURLs[(schedules-1)%2]}
+			return &schedulerv1.ScheduleResponse{Node: node}, nil
+		},
+	}, time.Second, 1024)
+
+	response := httptest.NewRecorder()
+	authenticatedTestHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/sandboxes-cold", strings.NewReader(`{"image":"img"}`)))
+
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("got %d: %s, want %d", response.Code, response.Body.String(), http.StatusBadGateway)
+	}
+	if schedules != 2 {
+		t.Fatalf("scheduled %d times, want 2", schedules)
+	}
+}
+
+// reservationScheduler places creates on endpoints in turn, one reservation each, and records what the gateway does with them.
+type reservationScheduler struct {
+	mu        sync.Mutex
+	endpoints []string
+	scheduled int
+	released  []string
+	recorded  []string
+}
+
+func (s *reservationScheduler) client() stubSchedulerClient {
+	return stubSchedulerClient{
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			endpoint := s.endpoints[s.scheduled%len(s.endpoints)]
+			s.scheduled++
+			return &schedulerv1.ScheduleResponse{
+				Node:          &schedulerv1.Node{NodeId: fmt.Sprintf("node-%d", s.scheduled), Endpoint: endpoint},
+				ReservationId: fmt.Sprintf("res-%d", s.scheduled),
+			}, nil
+		},
+		releaseReservationFunc: func(_ context.Context, req *schedulerv1.ReleaseReservationRequest, _ ...grpc.CallOption) (*schedulerv1.ReleaseReservationResponse, error) {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.released = append(s.released, req.GetReservationId())
+			return &schedulerv1.ReleaseReservationResponse{}, nil
+		},
+		recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.recorded = append(s.recorded, req.GetSandboxId()+"@"+req.GetReservationId())
+			return &schedulerv1.RecordAssignmentResponse{}, nil
+		},
+	}
+}
+
+func (s *reservationScheduler) check(t *testing.T, wantReleased, wantRecorded []string) {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !reflect.DeepEqual(s.released, wantReleased) {
+		t.Fatalf("released %v, want %v", s.released, wantReleased)
+	}
+	if !reflect.DeepEqual(s.recorded, wantRecorded) {
+		t.Fatalf("recorded %v, want %v", s.recorded, wantRecorded)
+	}
+}
+
+func nodeAnswering(code int, body string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		_, _ = w.Write([]byte(body))
+	}))
+}
+
+func TestScheduledCreateHandsItsReservationToRecordAssignment(t *testing.T) {
+	node := nodeAnswering(http.StatusCreated, `{"sandboxID":"sbx-1"}`)
+	defer node.Close()
+	scheduler := &reservationScheduler{endpoints: []string{node.URL}}
+	server := newTestServer(t, scheduler.client(), time.Second, 1024)
+
+	response := httptest.NewRecorder()
+	authenticatedTestHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/sandboxes-cold", strings.NewReader(`{"image":"img"}`)))
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("got %d: %s, want %d", response.Code, response.Body.String(), http.StatusCreated)
+	}
+	scheduler.check(t, nil, []string{"sbx-1@res-1"})
+}
+
+func TestScheduledCreateReleasesItsReservationWhenTheNodeRejectsIt(t *testing.T) {
+	node := nodeAnswering(http.StatusUnprocessableEntity, `{"message":"bad body"}`)
+	defer node.Close()
+	scheduler := &reservationScheduler{endpoints: []string{node.URL}}
+	server := newTestServer(t, scheduler.client(), time.Second, 1024)
+
+	response := httptest.NewRecorder()
+	authenticatedTestHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/sandboxes-cold", strings.NewReader(`{}`)))
+
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("got %d: %s, want %d", response.Code, response.Body.String(), http.StatusUnprocessableEntity)
+	}
+	scheduler.check(t, []string{"res-1"}, nil)
+}
+
+func TestScheduledCreateReleasesTheRefusingNodesReservation(t *testing.T) {
+	node := nodeAnswering(http.StatusCreated, `{"sandboxID":"sbx-1"}`)
+	defer node.Close()
+	scheduler := &reservationScheduler{endpoints: []string{refusedURL(t), node.URL}}
+	server := newTestServer(t, scheduler.client(), time.Second, 1024)
+
+	response := httptest.NewRecorder()
+	authenticatedTestHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/sandboxes-cold", strings.NewReader(`{"image":"img"}`)))
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("got %d: %s, want %d", response.Code, response.Body.String(), http.StatusCreated)
+	}
+	scheduler.check(t, []string{"res-1"}, []string{"sbx-1@res-2"})
+}
+
+func TestScheduledCreateRetriesOnAnotherNodeWhenTheConnectTimesOut(t *testing.T) {
+	node := nodeAnswering(http.StatusCreated, `{"sandboxID":"sbx-1"}`)
+	defer node.Close()
+	// A machine that lost power does not refuse; the connect times out.
+	const offAddr = "192.0.2.1:8000"
+	scheduler := &reservationScheduler{endpoints: []string{"http://" + offAddr, node.URL}}
+	server := newTestServer(t, scheduler.client(), time.Second, 1024)
+	server.proxyTransport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if addr == offAddr {
+			return (&net.Dialer{Timeout: time.Nanosecond}).DialContext(ctx, network, addr)
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+
+	response := httptest.NewRecorder()
+	authenticatedTestHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/sandboxes-cold", strings.NewReader(`{"image":"img"}`)))
+
+	if response.Code != http.StatusCreated {
+		t.Fatalf("got %d: %s, want %d", response.Code, response.Body.String(), http.StatusCreated)
+	}
+	scheduler.check(t, []string{"res-1"}, []string{"sbx-1@res-2"})
+}
+
+func TestScheduledCreateKeepsItsReservationWhenTheNodeMayHaveIt(t *testing.T) {
+	dropsConnection := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack failed: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer dropsConnection.Close()
+	scheduler := &reservationScheduler{endpoints: []string{dropsConnection.URL}}
+	server := newTestServer(t, scheduler.client(), time.Second, 1024)
+
+	response := httptest.NewRecorder()
+	authenticatedTestHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/sandboxes-cold", strings.NewReader(`{"image":"img"}`)))
+
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("got %d: %s, want %d", response.Code, response.Body.String(), http.StatusBadGateway)
+	}
+	scheduler.check(t, nil, nil)
 }

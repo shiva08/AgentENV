@@ -5,7 +5,7 @@
     "grpc_listen_addr": ":9090",
     "strategy": "round_robin",
     "report_ttl": "30s",
-    "binding_ttl": "30s",
+    "binding_ttl": "8760h",
     "nodes": [
       {
         "id": "node-a",

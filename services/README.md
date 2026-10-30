@@ -14,7 +14,7 @@ Go implementation of a distributed Gateway and pluggable Scheduler for AgentENV.
 - Scheduler supports both static node configuration and Kubernetes EndpointSlice discovery.
 - Scheduler sandbox binding store can be in-memory or Redis-backed.
 - Scheduler can run as a primary read/write service or as query-only replicas that serve only `LookupNode` from Redis.
-- Scheduler observes node health and sandbox roster from heartbeats, and drops expired sandbox-to-node bindings on heartbeat, node unregistration, or lookup.
+- Scheduler observes node health from heartbeats. A sandbox-to-node binding is written once at create; a node's sandbox list, sent in every heartbeat and applied only when it changed, adds missing bindings and removes deleted ones.
 - HTTP and WebSocket forwarding.
 - Optional gateway HTTPS with manual certificates or CertMagic automatic issuance
   and renewal. Local HTTP remains the default. See [Gateway HTTPS](#gateway-https).
@@ -99,6 +99,11 @@ make run-gateway
 
 The default local config uses `127.0.0.1:9090` for the scheduler.
 
+Runtime nodes must send heartbeats to the scheduler
+(`AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true` and
+`AENV_OBSERVABILITY_SCHEDULER_ENDPOINT=http://127.0.0.1:9090`); the scheduler
+places new sandboxes only on nodes with a recent heartbeat.
+
 The gateway and runtime nodes require the same API key for control-plane APIs.
 The gateway reads `AENV_API_KEY` or `/run/secrets/api-key`; it does not generate
 a key. The gateway routes data-plane requests without authenticating them
@@ -117,10 +122,11 @@ Scheduler discovery modes:
 General config notes:
 
 - `scheduler.report_ttl` must be a duration string such as `"30s"` in JSON config files.
-- `scheduler.binding_ttl` must be a duration string such as `"30s"` in JSON config files.
+- `scheduler.binding_ttl` must be a duration string such as `"8760h"` in JSON config files.
 - `scheduler.report_ttl` controls how long an observed node heartbeat stays healthy.
-- `scheduler.binding_ttl` controls how long sandbox-to-node bindings survive without a fresh `RecordAssignment` or heartbeat roster refresh.
+- `scheduler.binding_ttl` (default `8760h`) is how long a sandbox-to-node binding lives after it is written. Heartbeats do not renew bindings, so keep it longer than any sandbox lives; it only clears bindings nobody removed, such as those of a node that is gone for good.
 - `scheduler.redis_addr` selects Redis-backed sandbox binding storage when set; when empty, the scheduler uses the in-memory binding store. It accepts either `host:port` or a Redis URL such as `redis://[:password@]host:6379/db`.
+- While Redis is down, heartbeats still succeed and the next heartbeat retries the binding write. The scheduler keeps a marker key, `agentenv:scheduler:bindings:present`, and checks it about every 5 s; if Redis lost its data, every node's next heartbeat rewrites its bindings.
 - `--query-only` starts a read-only scheduler that supports only `LookupNode`; it requires `scheduler.redis_addr` and does not need node discovery config.
 - `scheduler.artifact_store_capacity` controls how many distinct P2P artifact keys the in-memory artifact index keeps before LRU eviction; defaults to `1000000`.
 - `scheduler.artifact_lookup_node_limit` controls how many node IDs a P2P artifact lookup returns; values `<= 0` return all matching nodes.
@@ -140,17 +146,29 @@ General config notes:
 
 The strategy interface receives `RichNode` values that carry the node identity (ID + endpoint) together with the latest heartbeat `NodeSnapshot` (sandbox counts, CPU, memory, disk metrics). Current built-in strategies ignore the snapshot, but custom strategy implementations can use it for load-aware decisions.
 
+### Node readiness
+
+Before any other filter, the scheduler keeps only `ready` nodes: nodes whose last heartbeat is newer than `scheduler.report_ttl`. Nodes that stopped sending heartbeats, unregistered, or never reported get no new sandboxes. One exception: for the first `scheduler.report_ttl` after the scheduler starts, nodes it has not heard from yet also count, because it has not been listening long enough to miss a heartbeat. When no node is `ready`, `Schedule` fails with `Unavailable` (`no ready nodes`), which the gateway returns as HTTP 503. Runtime nodes must therefore enable heartbeat reporting. After a scheduler restart, creates fail until the first heartbeats arrive.
+
 ### Node resource limit
 
 `scheduler.node_resource_limit` defines per-node resource thresholds that are evaluated **before** the strategy runs. Any node whose heartbeat snapshot exceeds a configured limit is removed from the candidate list, regardless of which strategy is in use. This is a generic guard-rail that sits above the strategy layer — strategies only see nodes that already passed the resource filter.
 
-Nodes that have not yet sent a heartbeat (no snapshot available) are always kept in the candidate list, since there are no metrics to evaluate.
+Only `ready` nodes reach this filter. During the startup grace (see "Node readiness"), a node that has not reported yet has no heartbeat snapshot and passes unchecked.
+
+For sandbox creates, the filter also counts the create itself and the creates already placed on the node that its heartbeat does not show yet, so a node at a limit is full. Example: with `max_sandbox_count: 1`, two creates arriving together on an empty node get one sandbox and one `no node has capacity`. When the scheduler picks a node for a create, it reserves a slot there, plus the vCPUs and memory for `POST /sandboxes-cold`. The reservation ends when:
+
+- the gateway reports that the node rejected the create or could not be reached (`ReleaseReservation`);
+- the node's heartbeat lists the sandbox, or two heartbeats after the assignment do not list it (it was deleted);
+- 10 minutes pass, for example when the gateway crashed or a create timed out.
+
+Reservations are kept in memory, so only one scheduler may place sandboxes. Upgrade gateways together with the scheduler: an older gateway never releases reservations, so a rejected create holds its slot for 10 minutes.
 
 All fields are optional. Omitting a field (or setting the whole block to `null`) disables that particular check.
 
 | Field | Type | Description |
 |---|---|---|
-| `max_sandbox_count` | uint32 | Maximum total sandbox count |
+| `max_sandbox_count` | uint32 | Maximum total sandbox count, starting sandboxes included |
 | `max_sandbox_starting_count` | uint32 | Maximum concurrently starting sandboxes |
 | `max_cpu_used_percent` | uint32 | Maximum observed CPU usage (0–100) |
 | `max_cpu_allocated_percent` | uint32 | Maximum allocated-CPU-to-physical-CPU ratio; can exceed 100 when overcommit is allowed |
@@ -170,7 +188,7 @@ Example:
 }
 ```
 
-When all nodes are filtered out, the scheduler returns `Unavailable` to the caller.
+When all nodes are filtered out, the scheduler returns `Unavailable` (`no node has capacity`) to the caller, which the gateway returns as HTTP 503.
 
 ## Gateway configuration
 
@@ -179,12 +197,14 @@ When all nodes are filtered out, the scheduler returns `Unavailable` to the call
 - `gateway.request_timeout` must be a duration string such as `"30s"` in JSON config files.
 - `gateway.request_timeout` bounds scheduler route resolution and regular control-plane requests. Data-plane requests routed by sandbox headers or host-based sandbox domains, streaming requests, and WebSocket connections reuse the client context after routing and are not cut off by this timeout.
 - `gateway.forward_response_size` only limits how much of a successful `POST /sandboxes` response the gateway buffers while extracting a sandbox ID for `RecordAssignment`; it is not a global response-size cap for all proxied traffic.
+- For sandbox creates (`POST /sandboxes`, `POST /v2/sandboxes`, `POST /sandboxes-cold` with bodies up to 64 KiB), if the gateway cannot connect to the node the scheduler picked (the node refuses, or does not answer within the 2 s connect timeout, as when its machine lost power), the gateway asks the scheduler once more, excluding that node, and sends the create there. It does not retry after a connection was made, because the node may already have the create.
 - Cluster list requests (`GET /sandboxes`, `GET /v2/sandboxes`) fan out to every scheduler node and merge results in the gateway. Direct requests to a backend node remain node-scoped.
-- Cluster list requests are strict all-or-nothing: if any node times out, returns a non-2xx response, or cannot be reached, the gateway fails the whole list request rather than returning partial data.
+- A node that cannot be reached, times out, or answers with a 5xx is left out of a cluster list, and the response names it in `x-agentenv-unavailable-nodes` (comma-separated node IDs); the list, `x-total-running` and pagination then cover only the nodes that answered. The gateway fails the list with `502` only when no node answers, and returns a node's 4xx as is, since the request itself was rejected.
 - `GET /nodes` returns scheduler-observed node snapshots (including runtime/resource counters), with optional `clusterID` filtering.
 - `GET /nodes/{id}` resolves node endpoint via scheduler and then proxies to the runtime node's admin endpoint.
 - `GATEWAY_REQUEST_TIMEOUT=<duration>` overrides `gateway.request_timeout` from the environment (for example, `1m30s`).
 - `GATEWAY_QUERY_ONLY_SCHEDULER_ADDR=<addr>` overrides `gateway.query_only_scheduler_addr` from the environment.
+- `gateway.idempotency_redis_addr` enables `Idempotency-Key` handling for `POST /sandboxes`, `POST /v2/sandboxes`, and `POST /sandboxes-cold`. The first request with a key creates the sandbox; retries with the same key and body get its stored response with `Idempotent-Replayed: true`, a reused key with a different body gets `422`, and a failed create releases the key. Results are kept in Redis for `gateway.idempotency_key_ttl` (default `120h`, 5 days; `GATEWAY_IDEMPOTENCY_KEY_TTL=<duration>` overrides it). It accepts `host:port` or a Redis URL; empty disables it. `GATEWAY_IDEMPOTENCY_REDIS_ADDR=<addr>` overrides it from the environment.
 - `gateway.sandbox_proxy_domains` enables host-based sandbox data-plane routing for `{port}-{sandboxID}.{domain}` URLs. Domains are normalized to lowercase, deduplicated, and must be valid DNS names. Sandbox IDs used in host routes must be lowercase RFC 952/1123 DNS labels, and the full `{port}-{sandboxID}` label must be at most 63 characters.
 - `GATEWAY_SANDBOX_PROXY_DOMAINS=<domain>[,<domain>...]` overrides `gateway.sandbox_proxy_domains` from the environment.
 
@@ -385,7 +405,9 @@ The make targets materialize a temporary Kustomize build context so Kubernetes r
 
 The DaemonSet injects scheduler-report identity and endpoint wiring for runtime nodes:
 
-- `AENV_NODE_ID` comes from Pod metadata name.
+- `AENV_NODE_ID` comes from the Kubernetes node name (`spec.nodeName`), the
+  same ID the scheduler reads from each EndpointSlice endpoint's `nodeName`.
+  Both must change together.
 - `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true` enables heartbeat reporting.
 - `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` is set to `http://agentenv-scheduler:9090`.
 - `AENV_SANDBOX_PROXY_DOMAINS` comes from the shared sandbox proxy ConfigMap.
@@ -452,6 +474,7 @@ Methods:
 - ListNodes
 - LookupNode
 - RecordAssignment
+- ReleaseReservation
 - Heartbeat
 - ListObservedNodes
 - ReportSandboxEvent

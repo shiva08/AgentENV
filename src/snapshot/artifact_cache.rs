@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
+use tempfile::TempPath;
 use tokio::fs;
 use tokio::sync::{watch, Mutex as AsyncMutex};
 use tracing::warn;
@@ -14,6 +15,7 @@ use crate::snapshot::types::RuntimeArtifactLease;
 
 const DEFAULT_MAX_SIZE_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
 const EVICTION_TARGET_RATIO: f64 = 0.8;
+const PARTIAL_FILE_PREFIX: &str = ".partial-";
 
 /// A reference-counted handle to a cached file.
 ///
@@ -162,7 +164,9 @@ impl LocalArtifactCache {
                 let mut inflight = self.inflight.lock().await;
                 if let Some(existing) = inflight.get(key).cloned() {
                     drop(inflight);
-                    wait_for_inflight_result(existing.receiver, key).await?;
+                    if !wait_for_inflight_result(existing.receiver.clone()).await? {
+                        self.forget_abandoned(key, &existing.receiver).await;
+                    }
                     continue;
                 }
 
@@ -176,9 +180,20 @@ impl LocalArtifactCache {
                     .await
                     .with_context(|| format!("create local cache dir '{}'", parent.display()))?;
             }
-            let result = fetch(local_path.clone())
-                .await
-                .with_context(|| format!("materialize '{key}' into local cache"));
+            // Rename into place, so a cancelled fetch never leaves a partial file that looks cached.
+            let result = async {
+                let partial = TempPath::try_from_path(
+                    local_path
+                        .with_file_name(format!("{PARTIAL_FILE_PREFIX}{}", uuid::Uuid::now_v7())),
+                )?;
+                let size = fetch(partial.to_path_buf()).await?;
+                fs::rename(&partial, &local_path)
+                    .await
+                    .with_context(|| format!("move fetched file to '{}'", local_path.display()))?;
+                Ok::<_, anyhow::Error>(size)
+            }
+            .await
+            .with_context(|| format!("materialize '{key}' into local cache"));
 
             let size = match result {
                 Ok(size) => size,
@@ -244,7 +259,9 @@ impl LocalArtifactCache {
                 inflight.get(key).cloned()
             };
             if let Some(existing) = existing {
-                wait_for_inflight_result(existing.receiver, key).await?;
+                if !wait_for_inflight_result(existing.receiver.clone()).await? {
+                    self.forget_abandoned(key, &existing.receiver).await;
+                }
                 continue;
             }
             break;
@@ -315,9 +332,25 @@ impl LocalArtifactCache {
         sender: watch::Sender<Option<InflightFetchResult>>,
         result: InflightFetchResult,
     ) {
+        // Remove first: if cancelled at the lock, waiters see no result and retry.
+        self.inflight.lock().await.remove(key);
         let _ = sender.send(Some(result));
+    }
+
+    /// Removes the in-flight entry for `key` if it is still the fetch that
+    /// ended without a result, never a newer one.
+    async fn forget_abandoned(
+        &self,
+        key: &str,
+        abandoned: &watch::Receiver<Option<InflightFetchResult>>,
+    ) {
         let mut inflight = self.inflight.lock().await;
-        inflight.remove(key);
+        if inflight
+            .get(key)
+            .is_some_and(|fetch| fetch.receiver.same_channel(abandoned))
+        {
+            inflight.remove(key);
+        }
     }
 
     fn try_acquire(self: &Arc<Self>, key: &str) -> Option<CacheHandle> {
@@ -420,22 +453,21 @@ impl SharedFetchError {
     }
 }
 
+/// Waits for another caller's fetch of the same key. Returns false if that
+/// fetch ended without a result, for example because its caller was cancelled.
 async fn wait_for_inflight_result(
     mut receiver: watch::Receiver<Option<InflightFetchResult>>,
-    key: &str,
-) -> Result<()> {
+) -> Result<bool> {
     loop {
         if let Some(result) = receiver.borrow().clone() {
             return match result {
-                InflightFetchResult::Success => Ok(()),
+                InflightFetchResult::Success => Ok(true),
                 InflightFetchResult::Failed(error) => Err(error.into_anyhow()),
             };
         }
 
         if receiver.changed().await.is_err() {
-            return Err(anyhow!(
-                "inflight cache materialization for '{key}' ended without a result"
-            ));
+            return Ok(false);
         }
     }
 }
@@ -449,10 +481,35 @@ fn prepare_cache_root(cache_root: &Path) -> Result<()> {
     })
 }
 
+/// Removes half-written downloads a crash left under `root`. Call it only before anything downloads.
+pub(crate) fn remove_partial_files(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(file_type) if file_type.is_dir() => remove_partial_files(&path),
+            Ok(_)
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(PARTIAL_FILE_PREFIX) =>
+            {
+                if let Err(error) = std::fs::remove_file(&path) {
+                    warn!(path = %path.display(), error = %error, "failed to remove a partial cache file");
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use super::*;
 
@@ -650,5 +707,136 @@ mod tests {
             b"warm-cache".to_vec()
         );
         assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ensure_cached_fetches_again_after_a_cancelled_fetch() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let cache = test_cache(tempdir.path());
+        let key = "artifacts/t1/vm_state.bin";
+
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            cache.ensure_cached(key, |_dest| std::future::pending::<Result<u64>>()),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the first fetch never finishes");
+
+        let handle = cache
+            .ensure_cached(key, |dest| async move {
+                tokio::fs::write(dest, b"snap-data").await?;
+                Ok(9)
+            })
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(handle.path()).unwrap(), b"snap-data".to_vec());
+    }
+
+    #[tokio::test]
+    async fn waiter_fetches_itself_when_the_fetch_it_waits_for_is_cancelled() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let cache = test_cache(tempdir.path());
+        let key = "artifacts/t1/vm_state.bin";
+        let first = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move {
+                cache
+                    .ensure_cached(key, |_dest| std::future::pending::<Result<u64>>())
+                    .await
+                    .map(drop)
+            }
+        });
+        while !cache.inflight.lock().await.contains_key(key) {
+            tokio::task::yield_now().await;
+        }
+        let waiter = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            async move {
+                cache
+                    .ensure_cached(key, |dest| async move {
+                        tokio::fs::write(dest, b"snap-data").await?;
+                        Ok(9)
+                    })
+                    .await
+                    .map(|handle| handle.path().to_path_buf())
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        first.abort();
+
+        let path = waiter.await.unwrap().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"snap-data".to_vec());
+    }
+
+    #[tokio::test]
+    async fn ensure_cached_never_reuses_the_partial_file_of_a_cancelled_fetch() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let cache = test_cache(tempdir.path());
+        let key = "artifacts/t1/vm_state.bin";
+        let wrote_half = Arc::new(tokio::sync::Notify::new());
+        let first = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let wrote_half = Arc::clone(&wrote_half);
+            async move {
+                cache
+                    .ensure_cached(key, |dest| {
+                        let wrote_half = Arc::clone(&wrote_half);
+                        async move {
+                            tokio::fs::write(dest, b"snap").await?;
+                            wrote_half.notify_one();
+                            std::future::pending::<Result<u64>>().await
+                        }
+                    })
+                    .await
+                    .map(drop)
+            }
+        });
+        wrote_half.notified().await;
+        first.abort();
+        let _ = first.await;
+
+        let handle = cache
+            .ensure_cached(key, |dest| async move {
+                tokio::fs::write(dest, b"snap-data").await?;
+                Ok(9)
+            })
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(handle.path()).unwrap(), b"snap-data".to_vec());
+    }
+
+    #[test]
+    fn remove_partial_files_removes_only_partial_files() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let partial = tempdir.path().join("artifacts/t1/.partial-0193");
+        let cached = tempdir.path().join("artifacts/t1/vm_state.bin");
+        std::fs::create_dir_all(partial.parent().unwrap()).unwrap();
+        std::fs::write(&partial, b"snap").unwrap();
+        std::fs::write(&cached, b"snap-data").unwrap();
+
+        remove_partial_files(tempdir.path());
+
+        assert!(!partial.exists());
+        assert_eq!(std::fs::read(&cached).unwrap(), b"snap-data".to_vec());
+    }
+
+    #[tokio::test]
+    async fn pin_local_file_ignores_a_fetch_that_ended_without_a_result() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let cache = test_cache(tempdir.path());
+        let key = "runtime/snapshot/image.json";
+        let local_path = tempdir.path().join("image.json");
+        std::fs::write(&local_path, b"runtime-config").unwrap();
+        let (sender, receiver) = watch::channel(None);
+        cache
+            .inflight
+            .lock()
+            .await
+            .insert(key.to_string(), InflightFetch { receiver });
+        drop(sender);
+
+        let handle = cache.pin_local_file(key, &local_path).await.unwrap();
+        assert_eq!(handle.path(), local_path.as_path());
+        assert!(!cache.inflight.lock().await.contains_key(key));
     }
 }

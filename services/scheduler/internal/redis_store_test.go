@@ -140,6 +140,28 @@ func TestRedisBindingStoreReconcileCases(t *testing.T) {
 	}
 }
 
+func TestRedisBindingStoreReconcileLeavesMatchingRecordsUntouched(t *testing.T) {
+	store := newRedisBindingStoreForTest(t, time.Hour)
+	node := Node{ID: "node-a", Endpoint: "http://10.0.0.1:8000"}
+	ctx := context.Background()
+
+	store.Record("sbx-1", node, time.Now())
+	if err := store.client.PExpire(ctx, store.bindingKey("sbx-1"), 2*time.Second).Err(); err != nil {
+		t.Fatalf("shorten binding ttl failed: %v", err)
+	}
+	store.ReconcileNode(node, []string{"sbx-1"}, time.Now())
+	if ttl := store.client.PTTL(ctx, store.bindingKey("sbx-1")).Val(); ttl <= 0 || ttl > 2*time.Second {
+		t.Fatalf("expected reconcile to leave the matching record's ttl alone, got %s", ttl)
+	}
+
+	store.ReconcileNode(Node{ID: "node-a", Endpoint: "http://10.0.0.9:8000"}, []string{"sbx-1"}, time.Now())
+	assertRedisBinding(t, store, "sbx-1", node)
+	if ttl := store.client.PTTL(ctx, store.bindingKey("sbx-1")).Val(); ttl <= 0 || ttl > 2*time.Second {
+		t.Fatalf("expected a new address alone not to rewrite the record, got ttl %s", ttl)
+	}
+	assertRedisSetEqual(t, store, store.nodeKey("node-a"), []string{"sbx-1"})
+}
+
 func newRedisBindingStoreForTest(t *testing.T, ttl time.Duration) *RedisBindingStore {
 	t.Helper()
 	addr := startRedisServerForTest(t)

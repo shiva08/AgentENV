@@ -159,6 +159,17 @@ func (s *RedisBindingStore) context() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), s.operationTimeout)
 }
 
+// DataLost reports whether Redis lost its data since the last call: only such a loss removes the marker key it sets.
+func (s *RedisBindingStore) DataLost() (bool, error) {
+	ctx, cancel := s.context()
+	defer cancel()
+	created, err := s.client.SetNX(ctx, s.keyPrefix+":present", "1", 0).Result()
+	if err != nil {
+		return false, fmt.Errorf("redis set binding marker: %w", err)
+	}
+	return created, nil
+}
+
 func (s *RedisBindingStore) bindingKey(sandboxID string) string {
 	return s.keyPrefix + ":sandbox:" + sandboxID
 }
@@ -167,8 +178,9 @@ func (s *RedisBindingStore) nodeKey(nodeID string) string {
 	return s.keyPrefix + ":node:" + nodeID
 }
 
+// The index must outlive the bindings it lists, or reconcile cannot find them to remove.
 func (s *RedisBindingStore) nodeIndexTTLMillis() int64 {
-	return int64(defaultRedisNodeIndexTTL / time.Millisecond)
+	return int64(max(defaultRedisNodeIndexTTL, s.bindingTTL) / time.Millisecond)
 }
 
 func normalizeSandboxIDs(sandboxIDs []string) []string {
@@ -292,10 +304,12 @@ end
 
 for sandbox_id, _ in pairs(desired) do
   local old_node_id = parse_node_id(redis.call("GET", binding_key(sandbox_id)))
-  if old_node_id and old_node_id ~= node_id then
-    redis.call("SREM", node_key_for(old_node_id), sandbox_id)
+  if old_node_id ~= node_id then
+    if old_node_id then
+      redis.call("SREM", node_key_for(old_node_id), sandbox_id)
+    end
+    redis.call("SET", binding_key(sandbox_id), value, "PX", ttl_ms)
   end
-  redis.call("SET", binding_key(sandbox_id), value, "PX", ttl_ms)
   redis.call("SADD", node_key, sandbox_id)
 end
 

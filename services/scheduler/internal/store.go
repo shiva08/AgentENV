@@ -8,12 +8,15 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 )
 
-const defaultBindingTTL = 30 * time.Second
+const defaultBindingTTL = 365 * 24 * time.Hour
 const defaultArtifactStoreCapacity = 1_000_000
 
 type BindingStore interface {
 	Get(sandboxID string, now time.Time) (Node, bool, error)
 	Record(sandboxID string, node Node, now time.Time) error
+	// ReconcileNode adds missing records, repoints records that name another node,
+	// and removes the node's unlisted records. Records already naming this node are
+	// left untouched, including their saved address and expiry.
 	ReconcileNode(node Node, sandboxIDs []string, now time.Time) error
 }
 
@@ -98,6 +101,9 @@ func (s *InMemoryBindingStore) ReconcileNode(node Node, sandboxIDs []string, now
 
 	expiresAt := now.Add(s.bindingTTL)
 	for sandboxID := range normalized {
+		if existing, ok := s.bindings[sandboxID]; ok && existing.node.ID == node.ID && existing.expiresAt.After(now) {
+			continue
+		}
 		s.upsertLockedWithExpiry(sandboxID, node, expiresAt)
 	}
 
