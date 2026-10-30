@@ -9,6 +9,8 @@ service Scheduler {
   rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
   rpc LookupNode(LookupNodeRequest) returns (LookupNodeResponse);
   rpc RecordAssignment(RecordAssignmentRequest) returns (RecordAssignmentResponse);
+  // Frees the capacity Schedule reserved for a create that made no sandbox.
+  rpc ReleaseReservation(ReleaseReservationRequest) returns (ReleaseReservationResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc ReportSandboxEvent(ReportSandboxEventRequest) returns (ReportSandboxEventResponse);
   rpc ListObservedNodes(ListObservedNodesRequest) returns (ListObservedNodesResponse);
@@ -56,10 +58,16 @@ message NewSandboxHint {
 message ScheduleRequest {
   reserved 1;  // formerly: string hint = 1
   ScheduleRequestHint hint = 2;
+  // Nodes the caller could not connect to; the scheduler does not pick them.
+  repeated string exclude_node_ids = 3;
 }
 
 message ScheduleResponse {
   Node node = 1;
+  // Set when the scheduler reserved capacity on the node for this create. Pass it
+  // to RecordAssignment when the create succeeds, or to ReleaseReservation when
+  // the node made no sandbox.
+  string reservation_id = 2;
 }
 
 message ListNodesRequest {}
@@ -79,9 +87,18 @@ message LookupNodeResponse {
 message RecordAssignmentRequest {
   string sandbox_id = 1;
   Node node = 2;
+  // From ScheduleResponse; the reservation ends once the node's heartbeat lists
+  // the sandbox.
+  string reservation_id = 3;
 }
 
 message RecordAssignmentResponse {}
+
+message ReleaseReservationRequest {
+  string reservation_id = 1;
+}
+
+message ReleaseReservationResponse {}
 
 message MachineInfo {
   string cpu_family = 1;

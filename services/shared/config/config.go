@@ -16,6 +16,11 @@ import (
 
 const defaultSchedulerArtifactStoreCapacity = 1_000_000
 
+// Heartbeats do not renew bindings, so this only clears records nobody removed.
+const defaultSchedulerBindingTTL = 365 * 24 * time.Hour
+
+const defaultGatewayIdempotencyKeyTTL = 5 * 24 * time.Hour
+
 type Node struct {
 	ID       string `json:"id"`
 	Endpoint string `json:"endpoint"`
@@ -187,9 +192,13 @@ type GatewayConfig struct {
 	MetricsListenAddr      string           `json:"metrics_listen_addr"`
 	SchedulerAddr          string           `json:"scheduler_addr"`
 	QueryOnlySchedulerAddr string           `json:"query_only_scheduler_addr"`
-	RequestTimeout         time.Duration    `json:"request_timeout"`
-	ForwardResponseSize    int64            `json:"forward_response_size"`
-	SandboxProxyDomains    []string         `json:"sandbox_proxy_domains"`
+	// IdempotencyRedisAddr enables Idempotency-Key handling for sandbox creates.
+	IdempotencyRedisAddr string `json:"idempotency_redis_addr"`
+	// IdempotencyKeyTTL is how long a key and its saved reply are kept.
+	IdempotencyKeyTTL   time.Duration `json:"idempotency_key_ttl"`
+	RequestTimeout      time.Duration `json:"request_timeout"`
+	ForwardResponseSize int64         `json:"forward_response_size"`
+	SandboxProxyDomains []string      `json:"sandbox_proxy_domains"`
 	// DebugMode enables debug-only behaviors in the gateway such as exposing
 	// the backend node id on proxied responses. It is off by default.
 	DebugMode bool `json:"debug_mode"`
@@ -203,6 +212,8 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 		MetricsListenAddr      *string           `json:"metrics_listen_addr"`
 		SchedulerAddr          *string           `json:"scheduler_addr"`
 		QueryOnlySchedulerAddr *string           `json:"query_only_scheduler_addr"`
+		IdempotencyRedisAddr   *string           `json:"idempotency_redis_addr"`
+		IdempotencyKeyTTL      json.RawMessage   `json:"idempotency_key_ttl"`
 		RequestTimeout         json.RawMessage   `json:"request_timeout"`
 		ForwardResponseSize    *int64            `json:"forward_response_size"`
 		SandboxProxyDomains    *[]string         `json:"sandbox_proxy_domains"`
@@ -232,6 +243,9 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	if parsed.QueryOnlySchedulerAddr != nil {
 		g.QueryOnlySchedulerAddr = *parsed.QueryOnlySchedulerAddr
 	}
+	if parsed.IdempotencyRedisAddr != nil {
+		g.IdempotencyRedisAddr = *parsed.IdempotencyRedisAddr
+	}
 	if parsed.ForwardResponseSize != nil {
 		g.ForwardResponseSize = *parsed.ForwardResponseSize
 	}
@@ -248,6 +262,13 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		g.RequestTimeout = d
+	}
+	if len(bytes.TrimSpace(parsed.IdempotencyKeyTTL)) > 0 {
+		d, err := parseSchedulerDuration(parsed.IdempotencyKeyTTL, "gateway.idempotency_key_ttl")
+		if err != nil {
+			return err
+		}
+		g.IdempotencyKeyTTL = d
 	}
 
 	return nil
@@ -319,7 +340,7 @@ func defaultConfig(service string) Config {
 			MetricsListenAddr:       ":9101",
 			Strategy:                "round_robin",
 			ReportTTL:               30 * time.Second,
-			BindingTTL:              30 * time.Second,
+			BindingTTL:              defaultSchedulerBindingTTL,
 			ArtifactStoreCapacity:   defaultSchedulerArtifactStoreCapacity,
 			ArtifactLookupNodeLimit: 0,
 			Nodes: []Node{
@@ -338,6 +359,7 @@ func defaultConfig(service string) Config {
 			HTTPListenAddr:      ":8080",
 			MetricsListenAddr:   ":9102",
 			SchedulerAddr:       "127.0.0.1:9090",
+			IdempotencyKeyTTL:   defaultGatewayIdempotencyKeyTTL,
 			RequestTimeout:      30 * time.Second,
 			ForwardResponseSize: 4 << 20,
 			SandboxProxyDomains: []string{},
@@ -362,6 +384,7 @@ func overrideWithEnv(cfg *Config) error {
 	set("GATEWAY_METRICS_LISTEN_ADDR", &cfg.Gateway.MetricsListenAddr)
 	set("GATEWAY_SCHEDULER_ADDR", &cfg.Gateway.SchedulerAddr)
 	set("GATEWAY_QUERY_ONLY_SCHEDULER_ADDR", &cfg.Gateway.QueryOnlySchedulerAddr)
+	set("GATEWAY_IDEMPOTENCY_REDIS_ADDR", &cfg.Gateway.IdempotencyRedisAddr)
 
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_SANDBOX_PROXY_DOMAINS")); v != "" {
 		cfg.Gateway.SandboxProxyDomains = splitCommaSeparated(v)
@@ -397,6 +420,14 @@ func overrideWithEnv(cfg *Config) error {
 			return fmt.Errorf("invalid GATEWAY_REQUEST_TIMEOUT %q: %w", v, err)
 		}
 		cfg.Gateway.RequestTimeout = d
+	}
+
+	if v := strings.TrimSpace(os.Getenv("GATEWAY_IDEMPOTENCY_KEY_TTL")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid GATEWAY_IDEMPOTENCY_KEY_TTL %q: %w", v, err)
+		}
+		cfg.Gateway.IdempotencyKeyTTL = d
 	}
 
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_DEBUG_MODE")); v != "" {
@@ -437,7 +468,7 @@ func (c *Config) applyDefaults() {
 		c.Scheduler.ReportTTL = 30 * time.Second
 	}
 	if c.Scheduler.BindingTTL <= 0 {
-		c.Scheduler.BindingTTL = 30 * time.Second
+		c.Scheduler.BindingTTL = defaultSchedulerBindingTTL
 	}
 	if strings.TrimSpace(c.Scheduler.Discovery.Mode) == "" {
 		c.Scheduler.Discovery.Mode = "static"
@@ -447,6 +478,9 @@ func (c *Config) applyDefaults() {
 	}
 	if strings.TrimSpace(c.Gateway.MetricsListenAddr) == "" {
 		c.Gateway.MetricsListenAddr = ":9102"
+	}
+	if c.Gateway.IdempotencyKeyTTL <= 0 {
+		c.Gateway.IdempotencyKeyTTL = defaultGatewayIdempotencyKeyTTL
 	}
 }
 

@@ -6,7 +6,7 @@
     "metrics_listen_addr": ":9101",
     "strategy": "round_robin",
     "report_ttl": "30s",
-    "binding_ttl": "30s",
+    "binding_ttl": "8760h",
     "redis_addr": "",
     "nodes": [
       {

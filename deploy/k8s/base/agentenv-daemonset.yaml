@@ -45,7 +45,7 @@ spec:
             - name: AENV_NODE_ID
               valueFrom:
                 fieldRef:
-                  fieldPath: metadata.name
+                  fieldPath: spec.nodeName
             - name: AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED
               value: "true"
             - name: AENV_OBSERVABILITY_SCHEDULER_ENDPOINT

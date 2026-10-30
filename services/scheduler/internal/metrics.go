@@ -44,6 +44,13 @@ var (
 		},
 		[]string{"status"},
 	)
+	schedulerSandboxLists = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_sandbox_lists_total",
+			Help: "Heartbeat sandbox lists by result: applied to the binding store, or unchanged and skipped.",
+		},
+		[]string{"result"},
+	)
 )
 
 func MetricsUnaryInterceptor() grpc.UnaryServerInterceptor {
@@ -71,6 +78,10 @@ func recordSchedulerSchedule(strategy string, start time.Time, err error) {
 	if err == nil {
 		schedulerScheduleAssignments.WithLabelValues(strategy).Inc()
 	}
+}
+
+func recordSandboxList(result string) {
+	schedulerSandboxLists.WithLabelValues(result).Inc()
 }
 
 func recordObservedNodes(nodes []*schedulerv1.ObservedNode) {

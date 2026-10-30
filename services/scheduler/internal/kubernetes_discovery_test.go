@@ -107,6 +107,50 @@ func TestFilterNodesByPodLabelsIgnoreIsExcluded(t *testing.T) {
 	}
 }
 
+func TestNodesFromEndpointSlicesUsesKubernetesNodeName(t *testing.T) {
+	active, _ := nodesFromEndpointSlices([]*discoveryv1.EndpointSlice{
+		newEndpointSlice(8000, onNode(servingEndpoint("agentenv-node-x7k2p", "10.0.0.1"), "worker-1")),
+	}, defaultDiscoveryCfg)
+
+	if len(active) != 1 || active[0].ID != "worker-1" {
+		t.Fatalf("expected node id worker-1 from the endpoint's node name, got %v", nodeIDs(active))
+	}
+}
+
+func TestNodesFromEndpointSlicesPrefersReplacementPodOnSameMachine(t *testing.T) {
+	active, lingering := nodesFromEndpointSlices([]*discoveryv1.EndpointSlice{
+		newEndpointSlice(8000,
+			onNode(terminatingEndpoint("agentenv-node-x7k2p", "10.0.0.1"), "worker-1"),
+			onNode(servingEndpoint("agentenv-node-q9m4d", "10.0.0.9"), "worker-1"),
+		),
+	}, defaultDiscoveryCfg)
+
+	if len(active) != 1 || active[0].Endpoint != "http://10.0.0.9:8000" {
+		t.Fatalf("expected the replacement pod's address for worker-1, got %+v", active)
+	}
+	if len(lingering) != 0 {
+		t.Fatalf("expected the terminating pod not to be listed under the same node id, got %+v", lingering)
+	}
+}
+
+func TestFilterNodesByPodLabelsMatchesPodByKubernetesNodeName(t *testing.T) {
+	pod := newPod("agentenv-node-x7k2p", map[string]string{"agentenv.io/scheduler-state": "no-schedule"})
+	pod.Spec.NodeName = "worker-1"
+	discovery := newDiscoveryWithPodLabelSelectors(t, "", "agentenv.io/scheduler-state=no-schedule", pod)
+
+	active, lingering := discovery.filterNodesByPodLabels(
+		[]Node{{ID: "worker-1", Endpoint: "http://10.0.0.1:8000"}, {ID: "worker-2", Endpoint: "http://10.0.0.2:8000"}},
+		nil,
+	)
+
+	if len(active) != 1 || active[0].ID != "worker-2" {
+		t.Fatalf("expected only worker-2 to stay active, got %v", nodeIDs(active))
+	}
+	if len(lingering) != 1 || lingering[0].ID != "worker-1" {
+		t.Fatalf("expected worker-1 to be lingering, got %v", nodeIDs(lingering))
+	}
+}
+
 func TestValidateOptionalPodSelector(t *testing.T) {
 	if err := validateOptionalPodSelector("", "ignore_pod_selector"); err != nil {
 		t.Fatalf("expected empty selector to be valid, got %v", err)
@@ -431,6 +475,11 @@ func endpointWithAddresses(name string, addresses []string) discoveryv1.Endpoint
 			Name: name,
 		},
 	}
+}
+
+func onNode(endpoint discoveryv1.Endpoint, nodeName string) discoveryv1.Endpoint {
+	endpoint.NodeName = &nodeName
+	return endpoint
 }
 
 func int32Ptr(v int32) *int32 {

@@ -20,6 +20,9 @@ import (
 
 const maxCursorSandboxID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
 
+// headerUnavailableNodes names, comma-separated, the nodes left out of a cluster list.
+const headerUnavailableNodes = "x-agentenv-unavailable-nodes"
+
 // clusterListCursorTimeFormat matches the node API, which always writes nine
 // fraction digits in UTC.
 const clusterListCursorTimeFormat = "2006-01-02T15:04:05.000000000Z07:00"
@@ -59,8 +62,9 @@ func (s listedSandbox) MarshalJSON() ([]byte, error) {
 }
 
 type clusterListResult struct {
-	items []listedSandbox
-	err   error
+	nodeID string
+	items  []listedSandbox
+	err    error
 }
 
 type clusterListStatusError struct {
@@ -111,7 +115,7 @@ func (s *Server) handleClusterList(w http.ResponseWriter, r *http.Request, routi
 		return
 	}
 
-	items, err := s.fetchClusterList(routingCtx, r, resp.GetNodes(), descending)
+	items, unavailable, err := s.fetchClusterList(routingCtx, r, resp.GetNodes(), descending)
 	if err != nil {
 		var statusErr *clusterListStatusError
 		if errors.As(err, &statusErr) && statusErr.statusCode >= 400 && statusErr.statusCode < 500 {
@@ -128,6 +132,9 @@ func (s *Server) handleClusterList(w http.ResponseWriter, r *http.Request, routi
 		return
 	}
 
+	if len(unavailable) > 0 {
+		w.Header().Set(headerUnavailableNodes, strings.Join(unavailable, ","))
+	}
 	w.Header().Set("Content-Type", "application/json")
 	if canonicalClusterListPath(r.URL.Path) != "/v2/sandboxes" {
 		s.writeJSON(w, http.StatusOK, items)
@@ -154,9 +161,11 @@ func (s *Server) handleClusterList(w http.ResponseWriter, r *http.Request, routi
 	s.writeJSON(w, http.StatusOK, page)
 }
 
-func (s *Server) fetchClusterList(ctx context.Context, incoming *http.Request, nodes []*schedulerv1.Node, descending bool) ([]listedSandbox, error) {
+// fetchClusterList merges the lists of the nodes that answered and returns the IDs of the
+// nodes that did not. It fails when no node answered or a node rejected the request (4xx).
+func (s *Server) fetchClusterList(ctx context.Context, incoming *http.Request, nodes []*schedulerv1.Node, descending bool) ([]listedSandbox, []string, error) {
 	if len(nodes) == 0 {
-		return nil, fmt.Errorf("no scheduler nodes available")
+		return nil, nil, fmt.Errorf("no scheduler nodes available")
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -171,14 +180,7 @@ func (s *Server) fetchClusterList(ctx context.Context, incoming *http.Request, n
 		go func() {
 			defer wg.Done()
 			items, err := s.fetchNodeClusterList(ctx, incoming, node)
-			if err != nil {
-				cancel()
-				results <- clusterListResult{
-					err: fmt.Errorf("node %s list failed: %w", node.GetNodeId(), err),
-				}
-				return
-			}
-			results <- clusterListResult{items: items}
+			results <- clusterListResult{nodeID: node.GetNodeId(), items: items, err: err}
 		}()
 	}
 
@@ -188,21 +190,32 @@ func (s *Server) fetchClusterList(ctx context.Context, incoming *http.Request, n
 	}()
 
 	merged := make([]listedSandbox, 0)
-	var firstErr error
-	var errOnce sync.Once
+	unavailable := make([]string, 0)
+	var lastErr error
 	for result := range results {
-		if result.err != nil {
-			errOnce.Do(func() { firstErr = result.err })
+		if result.err == nil {
+			merged = append(merged, result.items...)
 			continue
 		}
-		merged = append(merged, result.items...)
+		var statusErr *clusterListStatusError
+		if errors.As(result.err, &statusErr) && statusErr.statusCode >= 400 && statusErr.statusCode < 500 {
+			// The request itself was rejected, so the other nodes cannot do better.
+			return nil, nil, result.err
+		}
+		s.logger.Warn("cluster sandbox list left out a node",
+			zap.String("node_id", result.nodeID),
+			zap.Error(result.err),
+		)
+		unavailable = append(unavailable, result.nodeID)
+		lastErr = fmt.Errorf("node %s list failed: %w", result.nodeID, result.err)
 	}
-	if firstErr != nil {
-		return nil, firstErr
+	if len(unavailable) == len(nodes) {
+		return nil, nil, lastErr
 	}
 
+	sort.Strings(unavailable)
 	sortListedSandboxes(merged, descending)
-	return dedupListedSandboxes(merged), nil
+	return dedupListedSandboxes(merged), unavailable, nil
 }
 
 func (s *Server) fetchNodeClusterList(ctx context.Context, incoming *http.Request, node *schedulerv1.Node) ([]listedSandbox, error) {

@@ -2,10 +2,11 @@ package scheduler
 
 import "agentenv/services/shared/config"
 
-// FilterByResourceLimit removes nodes that exceed any configured resource
-// threshold. Nodes without a heartbeat snapshot are always kept (they have no
-// metrics to evaluate). A nil limit disables all filtering.
-func FilterByResourceLimit(nodes []RichNode, limit *config.NodeResourceLimit) []RichNode {
+// FilterByResourceLimit removes nodes that the request would take over a
+// configured limit, counting capacity already reserved for other creates
+// (pending, by node ID). Nodes without a heartbeat snapshot are always kept
+// (they have no metrics to evaluate). A nil limit disables all filtering.
+func FilterByResourceLimit(nodes []RichNode, limit *config.NodeResourceLimit, pending map[string]usage, request usage) []RichNode {
 	if limit == nil {
 		return nodes
 	}
@@ -17,7 +18,7 @@ func FilterByResourceLimit(nodes []RichNode, limit *config.NodeResourceLimit) []
 			result = append(result, n)
 			continue
 		}
-		if !withinLimit(n, limit) {
+		if !withinLimit(n, limit, pending[n.ID].plus(request)) {
 			continue
 		}
 		result = append(result, n)
@@ -25,13 +26,17 @@ func FilterByResourceLimit(nodes []RichNode, limit *config.NodeResourceLimit) []
 	return result
 }
 
-func withinLimit(n RichNode, limit *config.NodeResourceLimit) bool {
+func withinLimit(n RichNode, limit *config.NodeResourceLimit, extra usage) bool {
 	s := n.Snapshot
+	// A starting sandbox already holds its slot.
+	sandboxes := s.GetSandboxCount() + s.GetSandboxStartingCount() + extra.sandboxes
+	allocatedCPU := s.GetAllocatedCpu() + extra.cpu
+	allocatedMemory := s.GetAllocatedMemoryBytes() + extra.memoryBytes
 
-	if limit.MaxSandboxCount != nil && s.GetSandboxCount() > *limit.MaxSandboxCount {
+	if limit.MaxSandboxCount != nil && sandboxes > *limit.MaxSandboxCount {
 		return false
 	}
-	if limit.MaxSandboxStartingCount != nil && s.GetSandboxStartingCount() > *limit.MaxSandboxStartingCount {
+	if limit.MaxSandboxStartingCount != nil && s.GetSandboxStartingCount()+extra.sandboxes > *limit.MaxSandboxStartingCount {
 		return false
 	}
 	if limit.MaxCPUUsedPercent != nil && s.GetCpuPercent() > *limit.MaxCPUUsedPercent {
@@ -39,7 +44,7 @@ func withinLimit(n RichNode, limit *config.NodeResourceLimit) bool {
 	}
 	if limit.MaxCPUAllocatedPercent != nil {
 		if s.GetCpuCount() > 0 {
-			allocatedPercent := s.GetAllocatedCpu() * 100 / s.GetCpuCount()
+			allocatedPercent := allocatedCPU * 100 / s.GetCpuCount()
 			if allocatedPercent > *limit.MaxCPUAllocatedPercent {
 				return false
 			}
@@ -55,7 +60,7 @@ func withinLimit(n RichNode, limit *config.NodeResourceLimit) bool {
 	}
 	if limit.MaxMemoryAllocatedPercent != nil {
 		if s.GetMemoryTotalBytes() > 0 {
-			allocatedPercent := uint32(s.GetAllocatedMemoryBytes() * 100 / s.GetMemoryTotalBytes())
+			allocatedPercent := uint32(allocatedMemory * 100 / s.GetMemoryTotalBytes())
 			if allocatedPercent > *limit.MaxMemoryAllocatedPercent {
 				return false
 			}
@@ -67,19 +72,19 @@ func withinLimit(n RichNode, limit *config.NodeResourceLimit) bool {
 	// dropped from scheduling candidates regardless of whether the active-only
 	// counters are within limits.
 	if limit.MaxSandboxCountIncludingPaused != nil {
-		total := s.GetSandboxCount() + s.GetPausedSandboxCount()
+		total := sandboxes + s.GetPausedSandboxCount()
 		if total > *limit.MaxSandboxCountIncludingPaused {
 			return false
 		}
 	}
 	if limit.MaxAllocatedCPUIncludingPaused != nil {
-		total := s.GetAllocatedCpu() + s.GetPausedAllocatedCpu()
+		total := allocatedCPU + s.GetPausedAllocatedCpu()
 		if total > *limit.MaxAllocatedCPUIncludingPaused {
 			return false
 		}
 	}
 	if limit.MaxAllocatedMemoryBytesIncludingPaused != nil {
-		total := s.GetAllocatedMemoryBytes() + s.GetPausedAllocatedMemoryBytes()
+		total := allocatedMemory + s.GetPausedAllocatedMemoryBytes()
 		if total > *limit.MaxAllocatedMemoryBytesIncludingPaused {
 			return false
 		}

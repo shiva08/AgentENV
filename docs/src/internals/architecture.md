@@ -211,16 +211,16 @@ flowchart LR
 Binding lifecycle:
 
 - `RecordAssignment` creates the initial binding immediately after sandbox creation succeeds.
-- Runtime heartbeats include the node's full sandbox ID roster. Scheduler treats that roster as the source of truth for that node and removes bindings missing from the latest heartbeat.
-- `binding_ttl` is a freshness TTL for routing information, not a copy of sandbox timeout. If a binding stops being refreshed by gateway or heartbeats, scheduler drops it on the next lookup or roster reconcile.
-- `UnregisterNode` removes the observed node record and proactively clears bindings owned by that node.
+- Runtime heartbeats include the node's full sandbox ID roster. The scheduler applies a roster only when it differs from the last one it applied for that node, or when that was more than 10 minutes ago; an unchanged roster costs no store access. Scheduler treats an applied roster as the source of truth for that node: it adds missing bindings, repoints bindings that name another node, and removes bindings missing from the roster. Bindings that already name the node are not rewritten, even if its address changed. A deleted sandbox's binding is removed by its node's next heartbeat.
+- `binding_ttl` (default one year) is how long a binding lives after it is written; nothing renews it. It only clears bindings nobody removed, such as those of a node that never comes back.
+- `UnregisterNode` removes the observed node record. Bindings stay: a node that comes back under the same name still has its sandboxes, and its next roster removes the ones that are gone.
 
 Discovery modes:
 
 - `static`: explicit `scheduler.nodes` list from config
-- `kubernetes`: EndpointSlice watch over the headless `agentenv-nodes` Service, using ready DaemonSet Pod IPs as backend endpoints
+- `kubernetes`: EndpointSlice watch over the headless `agentenv-nodes` Service, using ready DaemonSet Pod IPs as backend endpoints and each endpoint's Kubernetes node name as the node ID, so a replacement Pod keeps its ID. `LookupNode` returns the node's current address rather than the one saved with the binding, and reports `Unavailable` (HTTP 503 through the gateway) for a node it does not currently know, since its saved address may belong to another Pod. Query-only schedulers have no node list and still return the saved address.
 
-**Limitations**: All bindings are in-memory (lost on scheduler restart). After a scheduler restart, bindings are rebuilt from new sandbox creations plus the next heartbeat roster from each runtime node. Kubernetes discovery updates the schedulable node set dynamically, but binding persistence is still not replicated.
+**Limitations**: With the default in-memory store, bindings are lost on scheduler restart. The scheduler then asks each runtime node for its roster in the reply to its next heartbeat, and rebuilds bindings from those rosters plus new sandbox creations. Use `scheduler.redis_addr` to keep bindings across restarts.
 
 **Deployment**:
 

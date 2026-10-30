@@ -23,7 +23,7 @@ func TestBindingStoreExpiresBindingsOnLookup(t *testing.T) {
 	}
 }
 
-func TestBindingStoreReconcileNodeRefreshesAndRemovesBindings(t *testing.T) {
+func TestBindingStoreReconcileNodeAddsAndRemovesWithoutRenewing(t *testing.T) {
 	store := NewInMemoryBindingStore(10 * time.Second)
 	node := Node{ID: "node-a", Endpoint: "http://node-a"}
 	base := time.Unix(200, 0)
@@ -42,8 +42,27 @@ func TestBindingStoreReconcileNodeRefreshesAndRemovesBindings(t *testing.T) {
 			t.Fatalf("expected %s to resolve to node-a, got (%+v, %v, %v)", sandboxID, got, ok, err)
 		}
 	}
-	if _, ok, err := store.Get("sbx-2", base.Add(11*time.Second)); err != nil || ok {
-		t.Fatalf("expected reconcile to refresh ttl from latest heartbeat time, got ok=%v err=%v", ok, err)
+	if _, ok, err := store.Get("sbx-2", base.Add(10*time.Second)); err != nil || ok {
+		t.Fatalf("expected reconcile to leave the existing record's expiry alone, got ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := store.Get("sbx-3", base.Add(10*time.Second)); err != nil || !ok {
+		t.Fatalf("expected the record added by reconcile to expire 10s after it, got ok=%v err=%v", ok, err)
+	}
+}
+
+func TestBindingStoreReconcileNodeIgnoresAddressChange(t *testing.T) {
+	store := NewInMemoryBindingStore(10 * time.Second)
+	base := time.Unix(250, 0)
+	saved := Node{ID: "node-a", Endpoint: "http://10.0.0.1:8000"}
+
+	store.Record("sbx-1", saved, base)
+	store.ReconcileNode(Node{ID: "node-a", Endpoint: "http://10.0.0.9:8000"}, []string{"sbx-1"}, base.Add(time.Second))
+
+	if got, ok, err := store.Get("sbx-1", base.Add(2*time.Second)); err != nil || !ok || got != saved {
+		t.Fatalf("expected the record to stay as written, got (%+v, %v, %v)", got, ok, err)
+	}
+	if _, ok, err := store.Get("sbx-1", base.Add(10*time.Second)); err != nil || ok {
+		t.Fatalf("expected the record's expiry not to be renewed, got ok=%v err=%v", ok, err)
 	}
 }
 

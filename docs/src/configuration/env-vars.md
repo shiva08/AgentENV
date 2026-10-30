@@ -92,6 +92,8 @@ These variables apply to both the gateway and scheduler processes.
 | `GATEWAY_SCHEDULER_ADDR` | `127.0.0.1:9090` | Scheduler gRPC address for routing and node lookup |
 | `GATEWAY_QUERY_ONLY_SCHEDULER_ADDR` | unset | Optional secondary scheduler gRPC address used only for sandbox data-plane `LookupNode` queries. When set, creation and control-plane calls still go to `GATEWAY_SCHEDULER_ADDR`. |
 | `GATEWAY_REQUEST_TIMEOUT` | `30s` | Override the gateway's HTTP request timeout (for example, `1m30s`) |
+| `GATEWAY_IDEMPOTENCY_REDIS_ADDR` | unset | Redis address (`host:port` or URL) that enables `Idempotency-Key` handling for sandbox creates |
+| `GATEWAY_IDEMPOTENCY_KEY_TTL` | `120h` | How long the reply to a create with an `Idempotency-Key` is kept for retries |
 | `GATEWAY_SANDBOX_PROXY_DOMAINS` | from config | Comma-separated DNS domains that enable gateway host-based sandbox proxy URLs like `{port}-{sandboxID}.{domain}`. Empty or unset keeps `gateway.sandbox_proxy_domains`. |
 | `GATEWAY_DEBUG_MODE` | `false` | Enable gateway debug mode |
 
@@ -103,6 +105,6 @@ These variables apply to both the gateway and scheduler processes.
 | `SCHEDULER_METRICS_LISTEN_ADDR` | `:9101` | Prometheus metrics listen address |
 | `SCHEDULER_STRATEGY` | `round_robin` | Node selection strategy for new sandboxes: `round_robin` or `random` |
 | `SCHEDULER_REDIS_ADDR` | unset | Redis address for persistent sandbox-to-node bindings (for example, `redis:6379`). Unset = in-memory bindings, lost on scheduler restart. |
-| `SCHEDULER_BINDING_TTL` | `30s` | How long a sandbox-to-node binding is kept without a confirming heartbeat. Accepts Go duration strings (for example, `1m`). |
+| `SCHEDULER_BINDING_TTL` | `8760h` | How long a sandbox-to-node binding lives after it is written. Heartbeats do not renew it, so keep it longer than any sandbox lives. Accepts Go duration strings (for example, `720h`). |
 | `SCHEDULER_ARTIFACT_STORE_CAPACITY` | `1000000` | Maximum number of P2P artifact entries held in the scheduler's in-memory index |
 | `SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT` | `0` | Maximum number of nodes checked per P2P artifact lookup. `0` means no limit. |

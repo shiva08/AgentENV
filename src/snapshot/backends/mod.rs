@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use super::artifact_cache::LocalArtifactCache;
+use super::artifact_cache::{remove_partial_files, LocalArtifactCache};
 use super::resolver::RepositoryRuntimeResolver;
 use super::SnapshotRuntimeResolver;
 use crate::cfg::{
@@ -25,7 +25,10 @@ use crate::repository::Repository;
 pub fn build_snapshot_backend(
     p2p_transport: Option<Arc<dyn P2pTransport>>,
 ) -> Result<(Arc<dyn Repository>, Arc<dyn SnapshotRuntimeResolver>)> {
-    build_snapshot_backend_from_config(ConfigManager::global_config(), p2p_transport)
+    let config = ConfigManager::global_config();
+    // Built once at server start, before anything downloads; the builder's cache lies below this root.
+    remove_partial_files(&config.snapshot.local_cache_path);
+    build_snapshot_backend_from_config(config, p2p_transport)
 }
 
 /// Internal builders share the configured durable backend, but have a separate

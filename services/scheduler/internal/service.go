@@ -2,9 +2,12 @@ package scheduler
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
@@ -23,6 +26,30 @@ type Service struct {
 	store         BindingStore
 	artifacts     ArtifactStore
 	resourceLimit *config.NodeResourceLimit
+	reserved      *reservations
+	startedAt     time.Time
+	startupGrace  time.Duration
+
+	sandboxListsMu sync.Mutex
+	sandboxLists   map[string]appliedSandboxList
+	lossCheckedAt  time.Time
+}
+
+// appliedSandboxList is the last sandbox list the scheduler applied for a node.
+type appliedSandboxList struct {
+	fingerprint [sha256.Size]byte
+	at          time.Time
+}
+
+// sandboxListResync re-applies an unchanged list now and then, so bindings lost from the store come back.
+var sandboxListResync = 10 * time.Minute
+
+// storeLossCheckInterval is how often a store that can lose its data is asked whether it did.
+var storeLossCheckInterval = 5 * time.Second
+
+// dataLossDetector is a binding store that can lose its data while the scheduler runs, such as Redis.
+type dataLossDetector interface {
+	DataLost() (bool, error)
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -33,11 +60,14 @@ func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store
 		nodes = NewAtomicNodeRegistry(nil, defaultObservedReportTTL)
 	}
 	s := &Service{
-		logger:    logger,
-		nodes:     nodes,
-		strategy:  strategy,
-		store:     store,
-		artifacts: NewInMemoryArtifactStore(defaultArtifactStoreCapacity, 0),
+		logger:       logger,
+		nodes:        nodes,
+		strategy:     strategy,
+		store:        store,
+		artifacts:    NewInMemoryArtifactStore(defaultArtifactStoreCapacity, 0),
+		reserved:     newReservations(),
+		startedAt:    time.Now(),
+		sandboxLists: make(map[string]appliedSandboxList),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -61,6 +91,14 @@ func WithArtifactStore(store ArtifactStore) ServiceOption {
 	}
 }
 
+// WithStartupGrace lets nodes with no heartbeat yet get new sandboxes for d after
+// the scheduler starts, since it has not listened long enough to miss one.
+func WithStartupGrace(d time.Duration) ServiceOption {
+	return func(s *Service) {
+		s.startupGrace = d
+	}
+}
+
 type QueryOnlyService struct {
 	schedulerv1.UnimplementedSchedulerServer
 	logger *zap.Logger
@@ -75,7 +113,7 @@ func NewQueryOnlyService(logger *zap.Logger, store BindingStore) *QueryOnlyServi
 }
 
 func (s *QueryOnlyService) LookupNode(_ context.Context, req *schedulerv1.LookupNodeRequest) (*schedulerv1.LookupNodeResponse, error) {
-	return lookupNode(s.logger, s.store, req)
+	return lookupNode(s.logger, s.store, nil, req)
 }
 
 func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) (resp *schedulerv1.ScheduleResponse, err error) {
@@ -85,15 +123,43 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	}()
 
 	discovered := s.nodes.Snapshot( /* allowLingering */ false)
-	rich := make([]RichNode, 0, len(discovered))
+	excluded := make(map[string]bool, len(req.GetExcludeNodeIds()))
+	for _, id := range req.GetExcludeNodeIds() {
+		excluded[id] = true
+	}
+	now := time.Now()
+	inStartupGrace := now.Sub(s.startedAt) < s.startupGrace
+	ready := make([]Node, 0, len(discovered))
 	for _, n := range discovered {
+		if excluded[n.ID] {
+			continue
+		}
+		observed, ok := s.nodes.GetObserved(n.ID, "", now)
+		if (ok && observed.GetSnapshot().GetStatus() == schedulerv1.NodeStatus_NODE_STATUS_READY) || (!ok && inStartupGrace) {
+			ready = append(ready, n)
+		}
+	}
+	if len(discovered) > 0 && len(ready) == 0 {
+		err = status.Error(codes.Unavailable, "no ready nodes")
+		return nil, err
+	}
+	request := createUsage(req.GetHint())
+	var pending map[string]usage
+	if s.resourceLimit != nil {
+		// From the capacity check to the reservation, so creates arriving together cannot take one free slot.
+		s.reserved.mu.Lock()
+		defer s.reserved.mu.Unlock()
+		pending = s.reserved.pendingLocked(now)
+	}
+	rich := make([]RichNode, 0, len(ready))
+	for _, n := range ready {
 		rich = append(rich, RichNode{
 			Node:     n,
 			Snapshot: s.nodes.PeekObserved(n.ID),
 		})
 	}
 
-	eligible := FilterByResourceLimit(rich, s.resourceLimit)
+	eligible := FilterByResourceLimit(rich, s.resourceLimit, pending, request)
 
 	node, selectErr := s.strategy.Select(eligible, req.GetHint())
 	if selectErr != nil {
@@ -105,11 +171,19 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 			zap.Error(selectErr),
 		)
 		if errors.Is(selectErr, ErrNoNodes) {
+			if len(rich) > 0 {
+				err = status.Error(codes.Unavailable, "no node has capacity")
+				return nil, err
+			}
 			err = status.Error(codes.Unavailable, "no nodes available")
 			return nil, err
 		}
 		err = status.Error(codes.Internal, selectErr.Error())
 		return nil, err
+	}
+	resp = &schedulerv1.ScheduleResponse{Node: node.Node.ToProto()}
+	if s.resourceLimit != nil && request.sandboxes > 0 {
+		resp.ReservationId = s.reserved.addLocked(node.ID, request, now)
 	}
 	s.logger.Debug("scheduler selected node",
 		zap.String("strategy", s.strategy.Name()),
@@ -118,8 +192,9 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		zap.String("endpoint", node.Endpoint),
 		zap.Int("candidate_nodes", len(rich)),
 		zap.Int("eligible_nodes", len(eligible)),
+		zap.String("reservation_id", resp.GetReservationId()),
 	)
-	return &schedulerv1.ScheduleResponse{Node: node.Node.ToProto()}, nil
+	return resp, nil
 }
 
 // summarizeScheduleHint renders a compact, log-friendly description of a
@@ -149,10 +224,12 @@ func (s *Service) ListNodes(_ context.Context, _ *schedulerv1.ListNodesRequest) 
 }
 
 func (s *Service) LookupNode(_ context.Context, req *schedulerv1.LookupNodeRequest) (*schedulerv1.LookupNodeResponse, error) {
-	return lookupNode(s.logger, s.store, req)
+	return lookupNode(s.logger, s.store, s.nodes.Resolve, req)
 }
 
-func lookupNode(logger *zap.Logger, store BindingStore, req *schedulerv1.LookupNodeRequest) (*schedulerv1.LookupNodeResponse, error) {
+// resolve, when set, supplies the node's current address. A node it does not know is
+// reported unavailable: its saved address may now belong to another pod.
+func lookupNode(logger *zap.Logger, store BindingStore, resolve func(string) (Node, bool), req *schedulerv1.LookupNodeRequest) (*schedulerv1.LookupNodeResponse, error) {
 	if strings.TrimSpace(req.GetSandboxId()) == "" {
 		return nil, status.Error(codes.InvalidArgument, "sandbox_id is required")
 	}
@@ -164,6 +241,17 @@ func lookupNode(logger *zap.Logger, store BindingStore, req *schedulerv1.LookupN
 	if !ok {
 		logger.Debug("scheduler lookup missed sandbox assignment", zap.String("sandbox_id", req.GetSandboxId()))
 		return nil, status.Error(codes.NotFound, "sandbox assignment not found")
+	}
+	if resolve != nil {
+		current, found := resolve(node.ID)
+		if !found || current.Endpoint == "" {
+			logger.Debug("scheduler lookup found sandbox on an unknown node",
+				zap.String("sandbox_id", req.GetSandboxId()),
+				zap.String("node_id", node.ID),
+			)
+			return nil, status.Error(codes.Unavailable, "node unavailable")
+		}
+		node.Endpoint = current.Endpoint
 	}
 	logger.Debug("scheduler lookup resolved sandbox assignment",
 		zap.String("sandbox_id", req.GetSandboxId()),
@@ -197,12 +285,23 @@ func (s *Service) RecordAssignment(_ context.Context, req *schedulerv1.RecordAss
 		)
 		return nil, status.Error(codes.Unavailable, "binding store unavailable")
 	}
+	if id := req.GetReservationId(); id != "" {
+		s.reserved.attach(id, req.GetSandboxId())
+	}
 	s.logger.Debug("scheduler recorded sandbox assignment",
 		zap.String("sandbox_id", req.GetSandboxId()),
 		zap.String("node_id", node.ID),
 		zap.String("endpoint", node.Endpoint),
 	)
 	return &schedulerv1.RecordAssignmentResponse{}, nil
+}
+
+func (s *Service) ReleaseReservation(_ context.Context, req *schedulerv1.ReleaseReservationRequest) (*schedulerv1.ReleaseReservationResponse, error) {
+	if strings.TrimSpace(req.GetReservationId()) == "" {
+		return nil, status.Error(codes.InvalidArgument, "reservation_id is required")
+	}
+	s.reserved.release(req.GetReservationId())
+	return &schedulerv1.ReleaseReservationResponse{}, nil
 }
 
 func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest) (*schedulerv1.HeartbeatResponse, error) {
@@ -223,14 +322,82 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 		}
 		return nil, status.Error(codes.Internal, "node registry heartbeat failed")
 	}
+	// The node's numbers now include the sandboxes it lists, so their reservations end.
+	s.reserved.settle(nodeID, req.GetSandboxIds())
+	// Every heartbeat carries the node's sandbox list; the store is touched only when it changed.
+	fingerprint := sandboxListFingerprint(req.GetSandboxIds())
+	s.forgetSandboxListsIfStoreLostData(now)
+	if s.sandboxListUnchanged(nodeID, fingerprint, now) {
+		recordSandboxList("unchanged")
+		return &schedulerv1.HeartbeatResponse{CpuConfigJson: cpuConfigJSON}, nil
+	}
 	if err := s.store.ReconcileNode(node, req.GetSandboxIds(), now); err != nil {
+		// Still answer OK: an error makes the node back off until it looks dead; the next heartbeat retries the write.
 		s.logger.Warn("scheduler heartbeat binding reconcile failed",
 			zap.String("node_id", nodeID),
 			zap.Error(err),
 		)
-		return nil, status.Error(codes.Unavailable, "binding store unavailable")
+		return &schedulerv1.HeartbeatResponse{CpuConfigJson: cpuConfigJSON}, nil
 	}
+	s.sandboxListsMu.Lock()
+	s.sandboxLists[nodeID] = appliedSandboxList{fingerprint: fingerprint, at: now}
+	s.sandboxListsMu.Unlock()
+	recordSandboxList("applied")
+	s.logger.Debug("scheduler applied node sandbox list",
+		zap.String("node_id", nodeID),
+		zap.Int("sandbox_count", len(req.GetSandboxIds())),
+	)
 	return &schedulerv1.HeartbeatResponse{CpuConfigJson: cpuConfigJSON}, nil
+}
+
+func (s *Service) sandboxListUnchanged(nodeID string, fingerprint [sha256.Size]byte, now time.Time) bool {
+	s.sandboxListsMu.Lock()
+	defer s.sandboxListsMu.Unlock()
+	last, ok := s.sandboxLists[nodeID]
+	return ok && last.fingerprint == fingerprint && now.Sub(last.at) < sandboxListResync
+}
+
+// forgetSandboxListsIfStoreLostData makes every node's next list apply again once the store lost its bindings.
+func (s *Service) forgetSandboxListsIfStoreLostData(now time.Time) {
+	detector, ok := s.store.(dataLossDetector)
+	if !ok {
+		return
+	}
+	s.sandboxListsMu.Lock()
+	due := now.Sub(s.lossCheckedAt) >= storeLossCheckInterval
+	if due {
+		s.lossCheckedAt = now
+	}
+	s.sandboxListsMu.Unlock()
+	if !due {
+		return
+	}
+
+	lost, err := detector.DataLost()
+	if err != nil {
+		s.logger.Warn("scheduler could not check the binding store for data loss", zap.Error(err))
+		return
+	}
+	if !lost {
+		return
+	}
+	s.sandboxListsMu.Lock()
+	defer s.sandboxListsMu.Unlock()
+	if len(s.sandboxLists) > 0 {
+		s.logger.Warn("binding store lost its data; each node's next heartbeat rewrites its bindings")
+		clear(s.sandboxLists)
+	}
+}
+
+func sandboxListFingerprint(sandboxIDs []string) [sha256.Size]byte {
+	ids := make([]string, 0, len(sandboxIDs))
+	for _, id := range sandboxIDs {
+		if id = strings.TrimSpace(id); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return sha256.Sum256([]byte(strings.Join(ids, "\n")))
 }
 
 func (s *Service) ReportSandboxEvent(_ context.Context, req *schedulerv1.ReportSandboxEventRequest) (*schedulerv1.ReportSandboxEventResponse, error) {
@@ -359,14 +526,11 @@ func (s *Service) UnregisterNode(_ context.Context, req *schedulerv1.UnregisterN
 		return nil, status.Error(codes.Internal, unregisterErr.Error())
 	}
 
-	now := time.Now()
-	if err := s.store.ReconcileNode(Node{ID: nodeID}, nil, now); err != nil {
-		s.logger.Warn("scheduler unregister binding reconcile failed",
-			zap.String("node_id", nodeID),
-			zap.Error(err),
-		)
-		return nil, status.Error(codes.Unavailable, "binding store unavailable")
-	}
+	// Bindings stay: a node that comes back under the same name still has its sandboxes,
+	// and its next list removes the ones that are gone.
+	s.sandboxListsMu.Lock()
+	delete(s.sandboxLists, nodeID)
+	s.sandboxListsMu.Unlock()
 	s.artifacts.ForgetNode(nodeID)
 
 	return &schedulerv1.UnregisterNodeResponse{}, nil

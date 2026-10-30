@@ -17,6 +17,7 @@ import (
 
 	schedulerv1 "agentenv/services/api/proto"
 
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -51,6 +52,10 @@ type ServerOptions struct {
 	DebugMode                bool
 	SandboxProxyDomains      []string
 	QueryOnlySchedulerClient schedulerv1.SchedulerClient
+	// IdempotencyRedis stores Idempotency-Key results; nil disables them.
+	IdempotencyRedis *redis.Client
+	// IdempotencyKeyTTL defaults to defaultIdempotencyKeyTTL when zero.
+	IdempotencyKeyTTL time.Duration
 }
 
 type Server struct {
@@ -67,6 +72,8 @@ type Server struct {
 	// header. Off by default; toggled via GatewayConfig.DebugMode.
 	debugMode           bool
 	sandboxProxyDomains []string
+	idempotency         *redis.Client
+	idempotencyTTL      time.Duration
 }
 
 func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, options ServerOptions) (*Server, error) {
@@ -82,6 +89,10 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 	if queryOnlyScheduler == nil {
 		queryOnlyScheduler = schedulerClient
 	}
+	idempotencyTTL := options.IdempotencyKeyTTL
+	if idempotencyTTL <= 0 {
+		idempotencyTTL = defaultIdempotencyKeyTTL
+	}
 
 	return &Server{
 		logger:              logger,
@@ -94,6 +105,8 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		apiKey:              []byte(options.APIKey),
 		debugMode:           options.DebugMode,
 		sandboxProxyDomains: sandboxProxyDomains,
+		idempotency:         options.IdempotencyRedis,
+		idempotencyTTL:      idempotencyTTL,
 	}, nil
 }
 
@@ -111,6 +124,8 @@ func newProxyTransport() *http.Transport {
 	// and IdleConnTimeout (90s by default).
 	transport.MaxIdleConns = 0
 	transport.MaxIdleConnsPerHost = 128
+	// A node that is gone may never answer; fail fast so a scheduled request can try another node.
+	transport.DialContext = (&net.Dialer{Timeout: 2 * time.Second, KeepAlive: 30 * time.Second}).DialContext
 	return transport
 }
 
@@ -157,6 +172,12 @@ func (s *Server) Handler() http.Handler {
 				http.NotFound(w, r)
 			}
 			return
+		}
+		if s.idempotency != nil && s.isSandboxCreate(r) {
+			if key := r.Header.Get(headerIdempotencyKey); key != "" {
+				s.handleIdempotentCreate(w, r, key)
+				return
+			}
 		}
 		s.handleProxy(w, r)
 	})
@@ -248,6 +269,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	setGatewayRouteSource(w, routeSource)
 	var node *schedulerv1.Node
+	var hint *schedulerv1.ScheduleRequestHint
+	var reservationID string
 
 	if hasSandbox {
 		rpcStart := time.Now()
@@ -266,7 +289,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !hasSandbox {
-		hint, err := buildScheduleHint(r)
+		var err error
+		hint, err = buildScheduleHint(r)
 		if err != nil {
 			// this only happens it cannot read request body, so the request cannot continue
 			s.logger.Warn("Fatal error when building schedule hint",
@@ -287,48 +311,78 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		node = resp.GetNode()
+		reservationID = resp.GetReservationId()
 	}
 
-	s.logger.Debug("gateway routed request",
-		zap.String("method", r.Method),
-		zap.String("path", r.URL.Path),
-		zap.String("route_source", string(routeSource)),
-		zap.String("sandbox_id", sandboxID),
-		zap.String("node_id", node.GetNodeId()),
-		zap.String("upstream_endpoint", node.GetEndpoint()),
-	)
+	forward := func(node *schedulerv1.Node, reservationID string, deferConnectFailure bool) (connectFailed bool) {
+		s.logger.Debug("gateway routed request",
+			zap.String("method", r.Method),
+			zap.String("path", r.URL.Path),
+			zap.String("route_source", string(routeSource)),
+			zap.String("sandbox_id", sandboxID),
+			zap.String("node_id", node.GetNodeId()),
+			zap.String("upstream_endpoint", node.GetEndpoint()),
+		)
 
-	decodedPath := upstreamTargetPath(routeSource, r.URL.Path)
-	escapedPath := upstreamTargetEscapedPath(routeSource, requestEscapedPath(r))
-	upstreamURL, err := joinUpstream(node.GetEndpoint(), decodedPath, escapedPath, r.URL.RawQuery)
-	if err != nil {
-		http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
+		decodedPath := upstreamTargetPath(routeSource, r.URL.Path)
+		escapedPath := upstreamTargetEscapedPath(routeSource, requestEscapedPath(r))
+		upstreamURL, err := joinUpstream(node.GetEndpoint(), decodedPath, escapedPath, r.URL.RawQuery)
+		if err != nil {
+			http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
+			return false
+		}
+
+		// Data-plane requests may legitimately wait for a guest service longer than
+		// the route-resolution deadline. Keep the client context after the node has
+		// been selected; control-plane and scheduled requests retain the bounded
+		// gateway request timeout.
+		upstreamCtx, cancelUpstream := requestContextForProxy(
+			r,
+			routingCtx,
+			longLived || isDataPlaneRouteSource(routeSource),
+		)
+		defer cancelUpstream()
+
+		return s.proxyRequest(
+			w,
+			r.Clone(upstreamCtx),
+			r.Context(),
+			upstreamURL,
+			node,
+			proxyRequestOptions{
+				recordAssignment:    shouldRecordAssignment(r, routeSource, hasSandbox),
+				reservationID:       reservationID,
+				hostRoute:           hostRoute,
+				flushImmediately:    longLived,
+				deferConnectFailure: deferConnectFailure,
+			},
+		)
+	}
+
+	// A scheduled request that could not connect never reached the node, so another node may take it once.
+	retryable := !hasSandbox && !longLived && (r.GetBody != nil || r.Body == http.NoBody)
+	if !forward(node, reservationID, retryable) {
 		return
 	}
-
-	// Data-plane requests may legitimately wait for a guest service longer than
-	// the route-resolution deadline. Keep the client context after the node has
-	// been selected; control-plane and scheduled requests retain the bounded
-	// gateway request timeout.
-	upstreamCtx, cancelUpstream := requestContextForProxy(
-		r,
-		routingCtx,
-		longLived || isDataPlaneRouteSource(routeSource),
-	)
-	defer cancelUpstream()
-
-	s.proxyRequest(
-		w,
-		r.Clone(upstreamCtx),
-		r.Context(),
-		upstreamURL,
-		node,
-		proxyRequestOptions{
-			recordAssignment: shouldRecordAssignment(r, routeSource, hasSandbox),
-			hostRoute:        hostRoute,
-			flushImmediately: longLived,
-		},
-	)
+	if r.GetBody != nil {
+		body, err := r.GetBody()
+		if err != nil {
+			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			return
+		}
+		r.Body = body
+	}
+	rpcStart := time.Now()
+	resp, err := s.scheduler.Schedule(routingCtx, &schedulerv1.ScheduleRequest{
+		Hint:           hint,
+		ExcludeNodeIds: []string{node.GetNodeId()},
+	})
+	recordGatewaySchedulerRPC("Schedule", rpcStart, err)
+	if err != nil {
+		s.writeSchedulerError(w, err)
+		return
+	}
+	forward(resp.GetNode(), resp.GetReservationId(), false)
 }
 
 func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {
@@ -351,8 +405,12 @@ func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {
 
 type proxyRequestOptions struct {
 	recordAssignment bool
+	// Capacity the scheduler reserved for this create; empty for other requests.
+	reservationID    string
 	hostRoute        *hostRoute
 	flushImmediately bool
+	// Report a failed connect to the caller instead of answering.
+	deferConnectFailure bool
 }
 
 func (s *Server) proxyRequest(
@@ -362,11 +420,11 @@ func (s *Server) proxyRequest(
 	target string,
 	node *schedulerv1.Node,
 	options proxyRequestOptions,
-) {
+) (connectFailed bool) {
 	upstreamURL, err := url.Parse(target)
 	if err != nil {
 		http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
-		return
+		return false
 	}
 
 	proxy := &httputil.ReverseProxy{
@@ -395,10 +453,15 @@ func (s *Server) proxyRequest(
 					resp.Header.Set(headerNodeID, nodeID)
 				}
 			}
-			if !options.recordAssignment || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				// The node answered without making a sandbox.
+				s.releaseReservation(originalCtx, options.reservationID)
 				return nil
 			}
-			return s.recordAssignmentFromResponse(originalCtx, resp, node, proxyReq.Method, proxyReq.URL.Path)
+			if !options.recordAssignment {
+				return nil
+			}
+			return s.recordAssignmentFromResponse(originalCtx, resp, node, proxyReq.Method, proxyReq.URL.Path, options.reservationID)
 		},
 		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, err error) {
 			if errors.Is(err, context.Canceled) {
@@ -413,6 +476,20 @@ func (s *Server) proxyRequest(
 					zap.String("target", upstreamURL.String()),
 				)
 				return
+			}
+
+			// Before the deadline check: a connect timeout can also match context.DeadlineExceeded, yet nothing reached the node.
+			if isConnectFailure(err) && proxyReq.Context().Err() == nil {
+				s.releaseReservation(originalCtx, options.reservationID)
+				if options.deferConnectFailure {
+					s.logger.Warn("could not connect to the node, trying another node",
+						zap.Error(err),
+						zap.String("node", node.GetNodeId()),
+						zap.String("path", proxyReq.URL.Path),
+					)
+					connectFailed = true
+					return
+				}
 			}
 
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(proxyReq.Context().Err(), context.DeadlineExceeded) {
@@ -445,7 +522,16 @@ func (s *Server) proxyRequest(
 	proxyStart := time.Now()
 	route := gatewayRouteLabel(proxyReq.URL.Path)
 	proxy.ServeHTTP(w, proxyReq)
-	recordGatewayUpstreamProxy(route, proxyStart, w, proxyReq.Context())
+	if !connectFailed {
+		recordGatewayUpstreamProxy(route, proxyStart, w, proxyReq.Context())
+	}
+	return connectFailed
+}
+
+// isConnectFailure reports whether err came from opening the connection, so nothing was sent.
+func isConnectFailure(err error) bool {
+	var opErr *net.OpError
+	return errors.As(err, &opErr) && opErr.Op == "dial"
 }
 
 func isStreamInputProxyRequest(r *http.Request) bool {
@@ -465,12 +551,12 @@ func (e *proxyResponseError) Error() string {
 	return e.message
 }
 
-func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node, requestMethod, requestPath string) error {
+func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node, requestMethod, requestPath, reservationID string) error {
 	recordCtx, cancelRecord := context.WithTimeout(ctx, recordAssignmentTimeout(s.requestTimeout))
 	defer cancelRecord()
 	route, _ := matchPathRoute(requestMethod, requestPath)
 	if route.owner == ownerNewBuild {
-		if err := s.recordAssignment(recordCtx, route.id, node, "template_build"); err != nil {
+		if err := s.recordAssignment(recordCtx, route.id, node, "template_build", ""); err != nil {
 			return &proxyResponseError{statusCode: http.StatusServiceUnavailable, message: "failed to route allocated build", cause: err}
 		}
 		return nil
@@ -483,14 +569,14 @@ func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Re
 		if buildID != route.id {
 			return &proxyResponseError{statusCode: http.StatusBadGateway, message: "upstream build response ID does not match the request"}
 		}
-		if err := s.recordAssignment(recordCtx, buildID, node, "template_build"); err != nil {
+		if err := s.recordAssignment(recordCtx, buildID, node, "template_build", ""); err != nil {
 			return &proxyResponseError{statusCode: http.StatusServiceUnavailable, message: "failed to route allocated build", cause: err}
 		}
 		return nil
 	}
 
 	if sandboxID, ok := sandboxIDFromHeaders(resp.Header); ok {
-		s.recordAssignment(recordCtx, sandboxID, node, "response_header")
+		s.recordAssignment(recordCtx, sandboxID, node, "response_header", reservationID)
 		return nil
 	}
 
@@ -527,14 +613,14 @@ func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Re
 		ids = extractForkSandboxIDsFromResponse(body)
 	}
 	for _, sandboxID := range ids {
-		s.recordAssignment(recordCtx, sandboxID, node, "response_body")
+		s.recordAssignment(recordCtx, sandboxID, node, "response_body", reservationID)
 	}
 	return nil
 }
 
-func (s *Server) recordAssignment(ctx context.Context, sandboxID string, node *schedulerv1.Node, source string) error {
+func (s *Server) recordAssignment(ctx context.Context, sandboxID string, node *schedulerv1.Node, source, reservationID string) error {
 	rpcStart := time.Now()
-	_, err := s.scheduler.RecordAssignment(ctx, &schedulerv1.RecordAssignmentRequest{SandboxId: sandboxID, Node: node})
+	_, err := s.scheduler.RecordAssignment(ctx, &schedulerv1.RecordAssignmentRequest{SandboxId: sandboxID, Node: node, ReservationId: reservationID})
 	recordGatewaySchedulerRPC("RecordAssignment", rpcStart, err)
 	if err != nil {
 		s.logger.Warn("record assignment failed", zap.Error(err), zap.String("sandbox_id", sandboxID), zap.String("node_id", node.GetNodeId()))
@@ -547,6 +633,22 @@ func (s *Server) recordAssignment(ctx context.Context, sandboxID string, node *s
 		zap.String("source", source),
 	)
 	return nil
+}
+
+// releaseReservation frees the capacity reserved for a create that made no sandbox.
+func (s *Server) releaseReservation(ctx context.Context, reservationID string) {
+	if reservationID == "" {
+		return
+	}
+	// Release even if the client has gone away.
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), recordAssignmentTimeout(s.requestTimeout))
+	defer cancel()
+	rpcStart := time.Now()
+	_, err := s.scheduler.ReleaseReservation(releaseCtx, &schedulerv1.ReleaseReservationRequest{ReservationId: reservationID})
+	recordGatewaySchedulerRPC("ReleaseReservation", rpcStart, err)
+	if err != nil {
+		s.logger.Warn("release reservation failed", zap.Error(err), zap.String("reservation_id", reservationID))
+	}
 }
 
 func readBodyWithLimit(src io.Reader, limit int64) ([]byte, bool, error) {

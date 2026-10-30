@@ -96,7 +96,9 @@ The make targets build a temporary Kustomize context so runtime Pods mount the r
 The runtime DaemonSet injects scheduler-report wiring for each node Pod:
 
 - `AENV_UBLK_DAEMON_BINARY_PATH=/usr/local/bin/uvm-ublk-daemon` so the Pod uses the `uvm-ublk-daemon` binary included in the runtime image
-- `AENV_NODE_ID` from Pod metadata name (`metadata.name`)
+- `AENV_NODE_ID` from the Kubernetes node name (`spec.nodeName`), which a
+  replacement Pod keeps, so the scheduler's sandbox records stay valid when a
+  Pod is replaced. Run exactly one runtime Pod per Kubernetes node.
 - `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true`
 - `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT=http://agentenv-scheduler:9090`
 - `AENV_SANDBOX_PROXY_DOMAINS` from the shared sandbox proxy ConfigMap

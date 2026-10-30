@@ -11,6 +11,7 @@ import (
 
 	"agentenv/services/shared/config"
 
+	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -240,6 +241,10 @@ func nodesFromEndpointSlices(slices []*discoveryv1.EndpointSlice, cfg config.Sch
 			}
 		}
 	}
+	// A pod replacing a terminating one on the same machine has the same node ID.
+	for id := range activeByID {
+		delete(lingeringByID, id)
+	}
 
 	active = mapsValues(activeByID)
 	lingering = mapsValues(lingeringByID)
@@ -275,13 +280,12 @@ func (d *KubernetesDiscovery) filterNodesByPodLabels(active []Node, lingering []
 			continue
 		}
 
-		key := d.config.Namespace + "/" + node.ID
-		if objectExistsInStore(d.ignorePodInformer, key) {
+		if nodePodInStore(d.ignorePodInformer, d.config.Namespace, node.ID) {
 			delete(activeByID, node.ID)
 			delete(lingeringByID, node.ID)
 			continue
 		}
-		if objectExistsInStore(d.noSchedulePodInformer, key) {
+		if nodePodInStore(d.noSchedulePodInformer, d.config.Namespace, node.ID) {
 			delete(activeByID, node.ID)
 			lingeringByID[node.ID] = node
 		}
@@ -306,9 +310,28 @@ func objectExistsInStore(informer cache.SharedIndexInformer, key string) bool {
 	return err == nil && exists && object != nil
 }
 
+// nodePodInStore reports whether the store holds the node's pod: the pod named
+// nodeID, or a pod running on the Kubernetes node nodeID.
+func nodePodInStore(informer cache.SharedIndexInformer, namespace string, nodeID string) bool {
+	if informer == nil {
+		return false
+	}
+	if objectExistsInStore(informer, namespace+"/"+nodeID) {
+		return true
+	}
+	for _, object := range informer.GetStore().List() {
+		if pod, ok := object.(*corev1.Pod); ok && pod.Spec.NodeName == nodeID {
+			return true
+		}
+	}
+	return false
+}
+
 // nodeFromEndpoint converts an EndpointSlice endpoint into a Node.
 // It uses the Serving condition (not Ready) to decide whether the endpoint
 // is usable, and Terminating to distinguish active from lingering nodes.
+// The node ID is the Kubernetes node name, which a replacement pod keeps;
+// the pod name is used only when the endpoint has none.
 func nodeFromEndpoint(endpoint discoveryv1.Endpoint, port int32, scheme string) (node Node, lingering bool, ok bool) {
 	serving := endpoint.Conditions.Serving != nil && *endpoint.Conditions.Serving
 	if !serving {
@@ -326,9 +349,13 @@ func nodeFromEndpoint(endpoint discoveryv1.Endpoint, port int32, scheme string) 
 
 	terminating := endpoint.Conditions.Terminating != nil && *endpoint.Conditions.Terminating
 
+	id := endpoint.TargetRef.Name
+	if endpoint.NodeName != nil && *endpoint.NodeName != "" {
+		id = *endpoint.NodeName
+	}
 	hostPort := net.JoinHostPort(address, strconv.Itoa(int(port)))
 	return Node{
-		ID:       endpoint.TargetRef.Name,
+		ID:       id,
 		Endpoint: fmt.Sprintf("%s://%s", scheme, hostPort),
 	}, terminating, true
 }

@@ -78,6 +78,7 @@ func captureRequestBody(r *http.Request) ([]byte, error) {
 	_ = orig.Close()
 	r.Body = io.NopCloser(bytes.NewReader(buf))
 	r.ContentLength = int64(len(buf))
+	r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(buf)), nil }
 	return buf, nil
 }
 
